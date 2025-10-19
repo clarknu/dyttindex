@@ -21,6 +21,14 @@ def get_conn() -> sqlite3.Connection:
     return conn
 
 
+# 新增：简单迁移，确保下载链接表有 episode 列
+def _migrate_download_links_episode(cur: sqlite3.Cursor) -> None:
+    cur.execute("PRAGMA table_info(download_links)")
+    cols = [row[1] for row in cur.fetchall()]
+    if "episode" not in cols:
+        cur.execute("ALTER TABLE download_links ADD COLUMN episode INTEGER")
+
+
 def create_db(drop: bool = False) -> None:
     if drop and os.path.exists(SQLITE_PATH):
         os.remove(SQLITE_PATH)
@@ -71,6 +79,8 @@ def create_db(drop: bool = False) -> None:
         );
         """
     )
+    # 迁移：为已存在的 download_links 增加 episode 列
+    _migrate_download_links_episode(cur)
     conn.commit()
     conn.close()
 
@@ -149,14 +159,14 @@ def upsert_movie(conn: sqlite3.Connection, data: Dict[str, Any]) -> int:
             (movie_id, tid),
         )
 
-    # 下载链接
+    # 下载链接（增加 episode 字段）
     for dl in (data.get("download_links") or []):
         url = dl.get("url")
         if not url:
             continue
         cur.execute(
-            "INSERT OR IGNORE INTO download_links(movie_id, url, kind, label) VALUES(?,?,?,?)",
-            (movie_id, url, dl.get("kind"), dl.get("label")),
+            "INSERT OR IGNORE INTO download_links(movie_id, url, kind, label, episode) VALUES(?,?,?,?,?)",
+            (movie_id, url, dl.get("kind"), dl.get("label"), dl.get("episode")),
         )
 
     conn.commit()
@@ -171,7 +181,7 @@ def get_movie(conn: sqlite3.Connection, movie_id: int) -> Optional[sqlite3.Row]:
 
 def get_download_links(conn: sqlite3.Connection, movie_id: int) -> List[sqlite3.Row]:
     cur = conn.cursor()
-    cur.execute("SELECT kind, url, label FROM download_links WHERE movie_id=?", (movie_id,))
+    cur.execute("SELECT kind, url, label, episode FROM download_links WHERE movie_id=?", (movie_id,))
     return cur.fetchall()
 
 
@@ -184,6 +194,10 @@ def search_movies(
     rating_min: Optional[float] = None,
     year_from: Optional[int] = None,
     year_to: Optional[int] = None,
+    language: Optional[str] = None,
+    director: Optional[str] = None,
+    actors_substr: Optional[str] = None,
+    rating_source: Optional[str] = None,
     limit: int = 50,
 ) -> List[sqlite3.Row]:
     sql = "SELECT id, title, kind, year, country, rating_source, rating_value, tags_text, detail_url FROM movies WHERE 1=1"
@@ -197,6 +211,18 @@ def search_movies(
     if country:
         sql += " AND country LIKE ?"
         params.append(f"%{country}%")
+    if language:
+        sql += " AND language LIKE ?"
+        params.append(f"%{language}%")
+    if director:
+        sql += " AND director LIKE ?"
+        params.append(f"%{director}%")
+    if actors_substr:
+        sql += " AND actors LIKE ?"
+        params.append(f"%{actors_substr}%")
+    if rating_source:
+        sql += " AND rating_source = ?"
+        params.append(rating_source)
     if rating_min is not None:
         sql += " AND rating_value >= ?"
         params.append(rating_min)

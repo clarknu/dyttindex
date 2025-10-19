@@ -4,7 +4,7 @@ import random
 import time
 import re
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Callable
 
 import requests
 from bs4 import BeautifulSoup
@@ -138,6 +138,45 @@ def parse_list_page(html: str, base_url: str) -> ListPage:
     return ListPage(detail_urls, next_url)
 
 
+# 新增：剧集解析，基于标签或文件名提取集数
+_EP_LABEL_PATTERNS = [
+    re.compile(r"第\s*(\d{1,3})\s*[集话]"),
+    re.compile(r"[Ee][Pp]?\s*(\d{1,3})"),
+    re.compile(r"[Ss]\d{1,2}[Ee](\d{1,2})"),
+]
+
+
+def _parse_episode(label: str, href: str) -> Optional[int]:
+    text = (label or "") + " " + (href or "")
+    # 先按常见模式匹配
+    for pat in _EP_LABEL_PATTERNS:
+        m = pat.search(text)
+        if m:
+            try:
+                return int(m.group(1))
+            except Exception:
+                return None
+    # 回退：文件名中的短数字（避免 720/1080 等分辨率）
+    m2 = re.search(r"[-_\s](\d{1,3})(?!\d)", text)
+    if m2:
+        try:
+            num = int(m2.group(1))
+            if 1 <= num <= 150:
+                return num
+        except Exception:
+            pass
+    # 进一步回退：含“集/话/期”的数字
+    m3 = re.search(r"(\d{1,3})\s*(?:集|话|期)", text)
+    if m3:
+        try:
+            num = int(m3.group(1))
+            if 1 <= num <= 150:
+                return num
+        except Exception:
+            pass
+    return None
+
+
 def _collect_download_links(soup: BeautifulSoup) -> List[dict]:
     links = []
     for a in soup.select("#Zoom a[href], a[href]"):
@@ -151,7 +190,7 @@ def _collect_download_links(soup: BeautifulSoup) -> List[dict]:
                 kind = k
                 break
         if kind:
-            links.append({"url": href, "kind": kind, "label": label})
+            links.append({"url": href, "kind": kind, "label": label, "episode": _parse_episode(label, href)})
     # 去重
     uniq, out = set(), []
     for dl in links:
@@ -289,18 +328,27 @@ def parse_detail_page(html: str, url: str) -> dict:
 class DyttScraper:
     def __init__(self):
         self.s = _session()
+        self._stop = False
 
-    def crawl_category(self, name: str, path: str, max_pages: int, max_items: int) -> int:
+    def stop(self) -> None:
+        self._stop = True
+
+    def crawl_category(self, name: str, path: str, max_pages: int, max_items: int, progress_cb: Optional[Callable[[dict], None]] = None) -> int:
         db = get_conn()
         count, pages = 0, 0
         url = _abs(path)
-        while url and pages < max_pages and count < max_items:
+        while url and pages < max_pages and count < max_items and not self._stop:
             html = fetch(url, self.s)
             if not html:
                 break
             lp = parse_list_page(html, config.BASE_URL)
+            if progress_cb:
+                try:
+                    progress_cb({"event": "page", "category": name, "page": pages + 1, "url": url, "found": len(lp.detail_urls)})
+                except Exception:
+                    pass
             for du in lp.detail_urls:
-                if count >= max_items:
+                if count >= max_items or self._stop:
                     break
                 detail_html = fetch(du, self.s)
                 if not detail_html:
@@ -308,6 +356,11 @@ class DyttScraper:
                 data = parse_detail_page(detail_html, du)
                 upsert_movie(db, data)
                 count += 1
+                if progress_cb:
+                    try:
+                        progress_cb({"event": "item", "category": name, "count": count, "detail_url": du})
+                    except Exception:
+                        pass
                 _sleep()
             url = lp.next_url
             pages += 1
@@ -315,11 +368,11 @@ class DyttScraper:
         db.close()
         return count
 
-    def crawl_all(self, max_pages_per_category: int, max_items_per_category: int) -> int:
+    def crawl_all(self, max_pages_per_category: int, max_items_per_category: int, progress_cb: Optional[Callable[[dict], None]] = None) -> int:
         total = 0
         for name, path in config.CATEGORIES.items():
             try:
-                total += self.crawl_category(name, path, max_pages_per_category, max_items_per_category)
+                total += self.crawl_category(name, path, max_pages_per_category, max_items_per_category, progress_cb=progress_cb)
             except Exception:
                 # 跳过异常，以保证整体流程
                 pass
