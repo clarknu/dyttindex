@@ -38,11 +38,11 @@ def _progress(event: dict):
         crawl_state["messages"] = crawl_state["messages"][-300:]
 
 
-def _run_crawl(max_pages: int, max_items: int):
+def _run_crawl(max_pages: int, max_items: int, sessionid: Optional[str] = None):
     global _scraper
     try:
         init_db(drop=False)
-        _scraper = DyttScraper()
+        _scraper = DyttScraper(session_id=sessionid)
         crawl_state["status"] = "running"
         crawl_state["started_at"] = time.time()
         crawl_state["messages"] = []
@@ -63,7 +63,8 @@ def api_crawl_start():
         return jsonify({"ok": False, "message": "已有抓取任务在运行"}), 400
     max_pages = int(request.json.get("max_pages", config.DEFAULT_MAX_PAGES_PER_CATEGORY))
     max_items = int(request.json.get("max_items", config.DEFAULT_MAX_ITEMS_PER_CATEGORY))
-    _crawl_thread = threading.Thread(target=_run_crawl, args=(max_pages, max_items), daemon=True)
+    sessionid = (request.json.get("sessionid") or "").strip() or None
+    _crawl_thread = threading.Thread(target=_run_crawl, args=(max_pages, max_items, sessionid), daemon=True)
     _crawl_thread.start()
     return jsonify({"ok": True})
 
@@ -93,213 +94,357 @@ def api_crawl_status():
 def index():
     html = r"""
     <!doctype html>
-    <html lang=zh>
+    <html lang="zh">
     <head>
       <meta charset="utf-8" />
-      <title>DYTT 抓取与检索 v2</title>
+      <meta name="viewport" content="width=device-width,initial-scale=1" />
+      <title>DYTT 抓取与检索 · 重设计</title>
       <style>
-        body { font-family: system-ui, sans-serif; margin: 20px; }
-        .row { display: flex; gap: 24px; }
-        .card { border: 1px solid #ddd; padding: 16px; border-radius: 8px; flex: 1; }
-        input, select { padding: 6px; margin: 4px 0; width: 100%; }
-        button { padding: 8px 12px; margin-top: 8px; }
-        table { border-collapse: collapse; width: 100%; }
-        th, td { border: 1px solid #eee; padding: 8px; text-align: left; }
-        .dl { font-size: 12px; color: #555; }
-        .status { font-size: 12px; color: #666; }
+        :root {
+          --bg: #f7f9fc; --card: #fff; --border: #e5e7eb; --muted: #6b7280; --text: #111827; --accent: #2563eb;
+        }
+        * { box-sizing: border-box; }
+        body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Noto Sans, Arial, "Microsoft YaHei"; margin: 0; background: var(--bg); color: var(--text); }
+        header { padding: 16px 24px; background: #fff; border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 999; }
+        header h1 { margin: 0; font-size: 18px; }
+        .container { padding: 16px 24px; display: grid; grid-template-columns: 1.2fr 0.8fr; gap: 16px; }
+        .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 14px; box-shadow: 0 1px 2px rgba(0,0,0,0.03); }
+        .card h3 { margin: 0 0 10px 0; font-size: 16px; }
+        .grid { display: grid; gap: 10px; }
+        .grid-2 { grid-template-columns: 1fr 1fr; }
+        label { font-size: 12px; color: var(--muted); display: block; margin-bottom: 4px; }
+        input, select, textarea { font-size: 14px; padding: 8px; border: 1px solid var(--border); border-radius: 8px; width: 100%; background: #fff; }
+        button { font-size: 14px; padding: 8px 12px; border: 1px solid var(--border); border-radius: 8px; background: #fff; cursor: pointer; }
+        button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+        button.ghost { background: transparent; }
+        .actions { display: flex; gap: 8px; }
+
+        table { width: 100%; border-collapse: collapse; }
+        thead th { position: sticky; top: 0; background: #fff; z-index: 2; }
+        th, td { border-bottom: 1px solid var(--border); padding: 8px; text-align: left; font-size: 13px; }
+        tbody tr:hover { background: #f3f6fc; }
+        tbody tr.selected { background: #e8f0fe; }
+        .muted { color: var(--muted); }
+        .status { font-size: 12px; color: var(--muted); white-space: pre-line; }
+        .pill { display: inline-block; padding: 2px 6px; border-radius: 999px; font-size: 12px; border: 1px solid var(--border); background: #fff; }
+        .dl-item { font-size: 13px; margin: 4px 0; }
+        .dl-item a { color: var(--accent); text-decoration: none; }
+        .dl-item a:hover { text-decoration: underline; }
       </style>
     </head>
     <body>
-      <h2>DYTT 抓取与检索 v2</h2>
-      <div class="row">
-        <div class="card">
-          <h3>抓取控制</h3>
-          <label>每类最多页数</label>
-          <input id=max_pages type=number min=1 value=10 />
-          <label>每类最多条目</label>
-          <input id=max_items type=number min=1 value=500 />
-          <button id=btn_start>开始抓取</button>
-          <button id=btn_stop>停止</button>
-          <div class=status>
-            <p>状态: <span id=st_text>idle</span></p>
-            <p>累计条目: <span id=st_total>0</span></p>
-            <details>
-              <summary>最近进度消息</summary>
-              <pre id=st_msgs style="max-height:200px; overflow:auto; background:#fafafa"></pre>
-            </details>
+      <header>
+        <h1>DYTT 抓取与检索 · 重设计</h1>
+      </header>
+      <div class="container">
+        <div class="grid">
+          <div class="card">
+            <h3>多条件检索</h3>
+            <div class="grid grid-2">
+              <div>
+                <label>关键字</label>
+                <input id="q_title" placeholder="标题关键词" />
+              </div>
+              <div>
+                <label>类别</label>
+                <select id="q_kind">
+                  <option value="">(不限)</option>
+                  <option value="movie">电影</option>
+                  <option value="tv">电视剧</option>
+                  <option value="variety">综艺</option>
+                  <option value="anime">动漫</option>
+                </select>
+              </div>
+              <div>
+                <label>国别</label>
+                <input id="q_country" placeholder="中国/日本/美国..." />
+              </div>
+              <div>
+                <label>语言</label>
+                <input id="q_language" placeholder="中文/日语/英语..." />
+              </div>
+              <div>
+                <label>导演</label>
+                <input id="q_director" placeholder="导演名包含" />
+              </div>
+              <div>
+                <label>演员</label>
+                <input id="q_actors" placeholder="演员名包含" />
+              </div>
+              <div>
+                <label>评分来源</label>
+                <select id="q_rating_src">
+                  <option value="">(不限)</option>
+                  <option value="Douban">豆瓣评分</option>
+                  <option value="IMDB">IMDB</option>
+                </select>
+              </div>
+              <div>
+                <label>评分下限</label>
+                <input id="q_rating_min" type="number" step="0.1" min="0" max="10" />
+              </div>
+              <div>
+                <label>年代起止</label>
+                <div class="actions">
+                  <input id="q_year_from" type="number" min="1900" max="2100" placeholder="起" />
+                  <input id="q_year_to" type="number" min="1900" max="2100" placeholder="止" />
+                </div>
+              </div>
+              <div>
+                <label>标签（逗号分隔）</label>
+                <input id="q_tags" placeholder="科幻, 喜剧, 动作" />
+              </div>
+            </div>
+            <div class="actions" style="margin-top:8px">
+              <button id="btn_search" class="primary">检索</button>
+              <span class="muted" id="search_hint">输入条件后点击检索</span>
+            </div>
           </div>
-        </div>
-        <div class="card">
-          <h3>多条件检索</h3>
-          <label>关键字</label>
-          <input id=q_title placeholder="标题关键词" />
-          <label>类别</label>
-          <select id=q_kind>
-            <option value="">(不限)</option>
-            <option value=movie>电影</option>
-            <option value=tv>电视剧</option>
-            <option value=variety>综艺</option>
-            <option value=anime>动漫</option>
-          </select>
-          <label>国别</label>
-          <input id=q_country placeholder="中国/日本/美国..." />
-          <label>语言</label>
-          <input id=q_language placeholder="中文/日语/英语..." />
-          <label>导演</label>
-          <input id=q_director placeholder="导演名包含" />
-          <label>演员</label>
-          <input id=q_actors placeholder="演员名包含" />
-          <label>评分来源</label>
-          <select id=q_rating_src>
-            <option value="">(不限)</option>
-            <option value=豆瓣评分>豆瓣评分</option>
-            <option value=IMDB>IMDB</option>
-          </select>
-          <label>评分下限</label>
-          <input id=q_rating_min type=number step=0.1 min=0 max=10 />
-          <label>年代范围</label>
-          <div style="display:flex; gap:8px">
-            <input id=q_year_from type=number min=1900 max=2100 placeholder="起" />
-            <input id=q_year_to type=number min=1900 max=2100 placeholder="止" />
-          </div>
-          <label>题材/标签（逗号分隔）</label>
-          <input id=q_tags placeholder="科幻, 喜剧, 动作" />
-          <button id=btn_search>检索</button>
-        </div>
-      </div>
-      <div class="card" style="margin-top:16px">
-        <h3>检索结果</h3>
-        <table id=tbl>
-          <thead><tr><th>ID</th><th>标题</th><th>类别</th><th>年份</th><th>国别</th><th>评分</th><th>标签</th><th>详情页</th></tr></thead>
-          <tbody id=tbody></tbody>
-        </table>
-      </div>
 
-      <div class="card" style="margin-top:16px">
-        <h3>数据管理（按ID）</h3>
-        <label>条目ID</label>
-        <div style="display:flex; gap:8px">
-          <input id=mgr_id type=number min=1 placeholder="如 123" />
-          <button id=btn_load>加载</button>
-          <button id=btn_save>保存</button>
-          <button id=btn_delete>删除</button>
+          <div class="card">
+            <h3>检索结果</h3>
+            <div style="max-height: 380px; overflow: auto; border: 1px solid var(--border); border-radius: 8px;">
+              <table>
+                <thead>
+                  <tr><th>ID</th><th>标题</th><th>类别</th><th>年份</th><th>国别</th><th>导演</th><th>演员</th><th>评分</th><th>标签</th><th>详情</th></tr>
+                </thead>
+                <tbody id="tbody"></tbody>
+              </table>
+            </div>
+            <div class="muted" id="results_hint" style="margin-top:6px">无结果</div>
+          </div>
+
+          <div class="card">
+            <h3>抓取控制</h3>
+            <div class="grid grid-2">
+              <div>
+                <label>会话ID（断点续爬）</label>
+                <input id="sessionid" placeholder="如 2025-10-taskA" />
+              </div>
+              <div>
+                <label>每类最多页数</label>
+                <input id="max_pages" type="number" min="1" value="5" />
+              </div>
+              <div>
+                <label>每类最多条目</label>
+                <input id="max_items" type="number" min="1" value="200" />
+              </div>
+              <div class="actions" style="align-items: end;">
+                <button id="btn_start" class="primary">开始抓取</button>
+                <button id="btn_stop">停止</button>
+              </div>
+            </div>
+            <div class="status" style="margin-top:8px">
+              <div>状态：<span id="st_text">idle</span> · 累计条目：<span id="st_total">0</span></div>
+              <details style="margin-top:6px">
+                <summary>最近进度消息</summary>
+                <pre id="st_msgs" style="max-height:180px; overflow:auto; background:#fafafa; padding:8px; border:1px solid var(--border); border-radius: 8px"></pre>
+              </details>
+            </div>
+          </div>
         </div>
-        <div style="margin-top:8px; font-size:14px; color:#555">
-          <p>标题：<span id=mgr_title></span></p>
-          <p>类别/年份/国别：<span id=mgr_meta></span></p>
-          <p>评分：<span id=mgr_rating></span></p>
+
+        <div class="card">
+          <h3>影片详情</h3>
+          <div id="detail_empty" class="muted">在左侧检索并点击条目以加载详情</div>
+          <div id="detail_box" style="display:none">
+            <div class="actions" style="margin-bottom:8px">
+              <button id="btn_save" class="primary">保存</button>
+              <button id="btn_delete">删除</button>
+            </div>
+            <div style="margin-bottom:8px">
+              <div style="font-size:18px; font-weight:600" id="mgr_title"></div>
+              <div class="muted" id="mgr_meta" style="margin-top:2px"></div>
+            </div>
+            <div class="grid grid-2">
+              <div>
+                <div><span class="pill" id="mgr_rating"></span></div>
+                <div style="margin-top:6px">导演：<span id="mgr_director"></span></div>
+                <div style="margin-top:4px">主演：<span id="mgr_actors"></span></div>
+              </div>
+              <div>
+                <label>标签（逗号分隔）</label>
+                <textarea id="mgr_tags" rows="2" placeholder="科幻,动作,喜剧"></textarea>
+              </div>
+            </div>
+            <div style="margin-top:8px">
+              <label>简介</label>
+              <textarea id="mgr_desc" rows="4" placeholder="简介文本"></textarea>
+            </div>
+            <div style="margin-top:8px">
+              <details>
+                <summary>下载链接（含剧集）</summary>
+                <div id="mgr_dl"></div>
+              </details>
+            </div>
+          </div>
         </div>
-        <label>标签（逗号分隔）</label>
-        <textarea id=mgr_tags rows=2 placeholder="科幻,动作,喜剧"></textarea>
-        <label>简介</label>
-        <textarea id=mgr_desc rows=4 placeholder="简介文本"></textarea>
-        <details style="margin-top:8px">
-          <summary>下载链接（含剧集）</summary>
-          <ul id=mgr_dl></ul>
-        </details>
       </div>
 
       <script>
-      // 恢复搜索功能，保留简化的拼接与容错
-      document.getElementById('btn_search').onclick = function(){
+      var current_id = null;
+      var currentRow = null;
+      function el(id){ return document.getElementById(id); }
+      function setText(id, v){ el(id).textContent = v || ''; }
+
+      function doSearch(){
         try{
           var p = new URLSearchParams();
           function add(k,v){ if(v) p.append(k,v); }
-          add('title', document.getElementById('q_title').value);
-          add('kind', document.getElementById('q_kind').value);
-          add('country', document.getElementById('q_country').value);
-          add('language', document.getElementById('q_language').value);
-          add('director', document.getElementById('q_director').value);
-          add('actors', document.getElementById('q_actors').value);
-          add('rating_source', document.getElementById('q_rating_src').value);
-          add('rating_min', document.getElementById('q_rating_min').value);
-          add('year_from', document.getElementById('q_year_from').value);
-          add('year_to', document.getElementById('q_year_to').value);
-          var rawTags = document.getElementById('q_tags').value.split(',');
+          add('title', el('q_title').value);
+          add('kind', el('q_kind').value);
+          add('country', el('q_country').value);
+          add('language', el('q_language').value);
+          add('director', el('q_director').value);
+          add('actors', el('q_actors').value);
+          add('rating_source', el('q_rating_src').value);
+          add('rating_min', el('q_rating_min').value);
+          add('year_from', el('q_year_from').value);
+          add('year_to', el('q_year_to').value);
+          var rawTags = (el('q_tags').value||'').split(',');
           for(var i=0;i<rawTags.length;i++){
             var t = rawTags[i].replace(/^[\s\u3000]+|[\s\u3000]+$/g, '');
-            if(t){ p.append('tag', t); }
+            if(t) p.append('tag', t);
           }
           fetch('/api/search?'+p.toString())
             .then(function(r){ return r.json(); })
-            .then(function(j){
-              var tb = document.getElementById('tbody');
-              tb.innerHTML = '';
-              for(var k=0;k<(j.results||[]).length;k++){
-                var row = j.results[k];
-                var tr = document.createElement('tr');
-                var html = '';
-                html += '<td>'+(row.id||'')+'</td>';
-                html += '<td>'+(row.title||'')+'</td>';
-                html += '<td>'+(row.kind||'')+'</td>';
-                html += '<td>'+(row.year||'')+'</td>';
-                html += '<td>'+(row.country||'')+'</td>';
-                html += '<td>'+((row.rating_source||'')+' '+(row.rating_value||''))+'</td>';
-                html += '<td>'+(row.tags_text||'')+'</td>';
-                html += '<td><a href="'+(row.detail_url||'#')+'" target="_blank">详情</a></td>';
-                tr.innerHTML = html;
-                tb.appendChild(tr);
-              }
-            })
+            .then(function(j){ renderResults(j.results || []); })
             .catch(function(e){ console.error(e); alert('检索失败'); });
         }catch(e){ console.error(e); alert('检索异常'); }
-      };
+      }
 
-      // 管理：加载、保存、删除
-      document.getElementById('btn_load').onclick = function(){
-        var id = parseInt(document.getElementById('mgr_id').value, 10);
-        if(!id){ alert('请输入ID'); return; }
+      function renderResults(list){
+        var tb = el('tbody');
+        tb.innerHTML = '';
+        el('results_hint').textContent = (list.length ? ('共 '+list.length+' 条结果') : '无结果');
+        for(var k=0;k<list.length;k++){
+          var row = list[k];
+          var tr = document.createElement('tr');
+          tr.innerHTML = ''+
+            '<td>'+(row.id||'')+'</td>'+
+            '<td>'+(row.title||'')+'</td>'+
+            '<td>'+(row.kind||'')+'</td>'+
+            '<td>'+(row.year||'')+'</td>'+
+            '<td>'+(row.country||'')+'</td>'+
+            '<td>'+(row.director||'')+'</td>'+
+            '<td>'+(row.actors||'')+'</td>'+
+            '<td>'+((row.rating_source||'')+' '+(row.rating_value||''))+'</td>'+
+            '<td>'+(row.tags_text||'')+'</td>'+
+            '<td><a href="'+(row.detail_url||'#')+'" target="_blank">详情</a></td>';
+          tr.style.cursor = 'pointer';
+          (function(id, trEl){ tr.onclick = function(){ selectRow(trEl); loadDetail(id); }; })(row.id, tr);
+          tb.appendChild(tr);
+        }
+      }
+
+      function selectRow(tr){
+        if(currentRow) currentRow.classList.remove('selected');
+        currentRow = tr; if(tr) tr.classList.add('selected');
+      }
+
+      function loadDetail(id){
+        current_id = id;
         fetch('/api/movie/'+id)
           .then(function(r){ if(!r.ok) throw new Error('未找到'); return r.json(); })
           .then(function(j){
             var m = j.movie || {};
-            document.getElementById('mgr_title').textContent = m.title || '';
-            document.getElementById('mgr_meta').textContent = (m.kind||'')+' / '+(m.year||'')+' / '+(m.country||'');
-            document.getElementById('mgr_rating').textContent = ((m.rating_source||'')+': '+(m.rating_value||''));
-            document.getElementById('mgr_tags').value = m.tags_text || '';
-            document.getElementById('mgr_desc').value = m.description || '';
-            var ul = document.getElementById('mgr_dl');
-            ul.innerHTML = '';
+            el('detail_empty').style.display = 'none';
+            el('detail_box').style.display = 'block';
+            setText('mgr_title', m.title);
+            setText('mgr_meta', (m.kind||'')+' / '+(m.year||'')+' / '+(m.country||''));
+            setText('mgr_rating', ((m.rating_source||'')+': '+(m.rating_value||'')));
+            setText('mgr_director', m.director);
+            setText('mgr_actors', m.actors);
+            el('mgr_tags').value = m.tags_text || '';
+            el('mgr_desc').value = m.description || '';
+            var box = el('mgr_dl'); box.innerHTML = '';
             var dls = j.downloads || [];
+            if(!dls.length){ box.innerHTML = '<div class="muted">无下载链接</div>'; return; }
             for(var i=0;i<dls.length;i++){
               var d = dls[i];
-              var li = document.createElement('li');
               var epi = d.episode ? ('第'+d.episode+'集 ') : '';
-              li.textContent = (d.kind||'')+' '+epi+(d.label||'');
-              ul.appendChild(li);
+              var linkText = (d.url||'').startsWith('magnet:?') || (d.url||'').startsWith('ed2k://') ? (d.url||'') : (d.label||d.url||'');
+              var div = document.createElement('div');
+              div.className = 'dl-item';
+              div.innerHTML = '<span class="muted">['+(d.kind||'')+']</span> '+epi+'<a href="'+(d.url||'#')+'" target="_blank">'+linkText+'</a>';
+              if((d.url||'').startsWith('magnet:?')){
+                var btn = document.createElement('button');
+                btn.textContent = '复制磁链';
+                btn.className = 'ghost';
+                btn.style.marginLeft = '8px';
+                btn.onclick = (function(u){ return function(){ navigator.clipboard.writeText(u).then(function(){ alert('已复制磁链'); }); }; })(d.url||'');
+                div.appendChild(btn);
+              }
+              box.appendChild(div);
             }
           })
           .catch(function(e){ alert('加载失败: '+e.message); });
-      };
+      }
 
-      document.getElementById('btn_save').onclick = function(){
-        var id = parseInt(document.getElementById('mgr_id').value, 10);
-        if(!id){ alert('请输入ID'); return; }
-        var body = JSON.stringify({
-          tags_text: document.getElementById('mgr_tags').value,
-          description: document.getElementById('mgr_desc').value,
-        });
+      el('btn_save').onclick = function(){
+        var id = current_id; if(!id){ alert('请先在检索结果中点击某条目'); return; }
+        var body = JSON.stringify({ tags_text: el('mgr_tags').value, description: el('mgr_desc').value });
         fetch('/api/movie/'+id, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: body })
           .then(function(r){ return r.json(); })
           .then(function(j){ alert(j.ok ? '保存成功' : '保存失败'); })
           .catch(function(e){ alert('保存失败: '+e.message); });
       };
-
-      document.getElementById('btn_delete').onclick = function(){
-        var id = parseInt(document.getElementById('mgr_id').value, 10);
-        if(!id){ alert('请输入ID'); return; }
+      el('btn_delete').onclick = function(){
+        var id = current_id; if(!id){ alert('请先在检索结果中点击某条目'); return; }
         if(!confirm('确认删除该条目及其下载链接？')) return;
         fetch('/api/movie/'+id, { method: 'DELETE' })
           .then(function(r){ return r.json(); })
           .then(function(j){ alert(j.ok ? '删除成功' : '删除失败'); })
           .catch(function(e){ alert('删除失败: '+e.message); });
       };
+
+      function pollStatus(){
+        fetch('/api/crawl/status')
+          .then(function(r){ return r.json(); })
+          .then(function(j){
+            setText('st_text', j.status || 'idle');
+            setText('st_total', j.total || 0);
+            var msgs = j.messages || [];
+            var lines = msgs.map(function(ev){
+              var et = ev.event || ''; var src = ev.category || ev.section || ''; var msg = ev.message || ''; var url = ev.detail_url || ev.url || '';
+              if(et==='item'){ return '['+src+'] #'+(ev.count||'')+' '+(ev.title||'')+' ('+(ev.year||'')+') '+(ev.kind||''); }
+              else if(et==='page'){ return '['+src+'] page '+(ev.page||'')+': '+(ev.url||'')+' found='+ev.found; }
+              else if(et==='category_done'){ return '['+src+'] done count='+ev.count; }
+              else if(et==='error'){ return '['+src+'] ERROR '+msg+' -> '+url; }
+              else if(et==='warn'){ return '['+src+'] WARN '+msg+' -> '+url; }
+              else if(et==='site_start'){ return 'site_start: '+(ev.url||''); }
+              else { return (et||'event')+': '+url; }
+            }).join('\n');
+            el('st_msgs').textContent = lines;
+          })
+          .catch(function(_){ /* ignore */ });
+      }
+      var crawlTimer = null;
+      el('btn_start').onclick = function(){
+        var body = JSON.stringify({
+          max_pages: parseInt(el('max_pages').value, 10) || 5,
+          max_items: parseInt(el('max_items').value, 10) || 200,
+          sessionid: (el('sessionid').value||'').trim()
+        });
+        fetch('/api/crawl/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: body })
+          .then(function(r){ return r.json(); })
+          .then(function(j){ if(!j.ok){ alert(j.message || '启动失败'); return; } setText('st_text', 'running'); if(crawlTimer) clearInterval(crawlTimer); crawlTimer = setInterval(pollStatus, 1000); })
+          .catch(function(e){ alert('启动失败: '+e.message); });
+      };
+      el('btn_stop').onclick = function(){
+        fetch('/api/crawl/stop', { method: 'POST' })
+          .then(function(r){ return r.json(); })
+          .then(function(j){ if(!j.ok){ alert(j.message || '停止失败'); return; } setTimeout(pollStatus, 500); })
+          .catch(function(e){ alert('停止失败: '+e.message); });
+      };
+
+      el('btn_search').onclick = doSearch;
+      pollStatus();
       </script>
     </body>
     </html>
     """
     return render_template_string(html)
-
 
 @app.get("/api/search")
 def api_search():

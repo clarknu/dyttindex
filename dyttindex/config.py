@@ -1,6 +1,14 @@
 from __future__ import annotations
 
 BASE_URL = "http://www.dydytt.net"  # 使用 HTTP 以提升可访问性
+# 备用镜像列表（按优先级排列）
+BASE_MIRRORS = [
+    "http://www.dydytt.net",
+    "https://www.dydytt.net",
+    "http://www.ygdy8.net",
+    "https://www.ygdy8.net",
+    "http://www.ygdy8.com",
+]
 
 # 代表性类别页（常见电影天堂站点结构，可能部分不存在；爬虫会自动跳过404）
 CATEGORIES = {
@@ -36,3 +44,10 @@ SQLITE_PATH = "c:/Code/dyttindex/data/movies.db"
 # 最大分页与条目控制，避免过度抓取
 DEFAULT_MAX_PAGES_PER_CATEGORY = 50
 DEFAULT_MAX_ITEMS_PER_CATEGORY = 2000
+
+# 自动遍历模式的总量默认值
+DEFAULT_MAX_PAGES_TOTAL = 300
+DEFAULT_MAX_ITEMS_TOTAL = 3000
+
+# 是否屏蔽 HTTPS 证书相关警告
+SUPPRESS_TLS_WARNINGS = True

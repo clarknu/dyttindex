@@ -26,17 +26,66 @@ def init_db_cmd(drop: bool = typer.Option(False, help="是否清空并重建数�
     console.print("[green]SQLite 初始化完成[/green]: ", config.SQLITE_PATH)
 
 @app.command()
-def crawl(max_pages_per_category: int = typer.Option(config.DEFAULT_MAX_PAGES_PER_CATEGORY, help="每个类别最多分页数"),
-          max_items_per_category: int = typer.Option(config.DEFAULT_MAX_ITEMS_PER_CATEGORY, help="每个类别最多抓取条目数")):
+def crawl(
+    auto: bool = typer.Option(True, "--auto/--fixed", help="自动从根路径遍历抓取"),
+    start_url: Optional[str] = typer.Option(None, help="起始URL，默认使用 BASE_URL"),
+    max_pages_total: int = typer.Option(config.DEFAULT_MAX_PAGES_TOTAL, help="总页面遍历上限（auto模式）"),
+    max_items_total: int = typer.Option(config.DEFAULT_MAX_ITEMS_TOTAL, help="总条目上限（auto模式）"),
+    max_pages_per_category: int = typer.Option(config.DEFAULT_MAX_PAGES_PER_CATEGORY, help="固定分类模式每类最多分页数"),
+    max_items_per_category: int = typer.Option(config.DEFAULT_MAX_ITEMS_PER_CATEGORY, help="固定分类模式每类最多抓取条目数"),
+    verbose: bool = typer.Option(True, "--verbose/--no-verbose", help="打印抓取进度"),
+    jsonl: bool = typer.Option(False, "--json/--no-json", help="以 JSON 行输出进度事件"),
+    session_id: Optional[str] = typer.Option(None, "--session-id", help="会话ID，用于断点续爬与事件日志"),
+):
     init_db(drop=False)
-    s = DyttScraper()
-    total = s.crawl_all(max_pages_per_category, max_items_per_category)
+    s = DyttScraper(session_id=session_id)
+    def _progress(ev: dict):
+        try:
+            if jsonl:
+                import json
+                print(json.dumps(ev, ensure_ascii=False))
+                return
+            et = ev.get("event")
+            src = ev.get("category") or ev.get("section") or "site"
+            if et == "site_start":
+                console.print(f"[bold blue]开始遍历[/bold blue]: {ev.get('url')}")
+            elif et == "category_start":
+                console.print(f"[bold blue]开始分类[/bold blue]: {src}")
+            elif et == "page":
+                if not verbose:
+                    return
+                console.print(f"[cyan]页面[/cyan] [{src}] -> {ev.get('url')} 详情{ev.get('found')}条 队列+{ev.get('queued')}")
+            elif et == "item":
+                if not verbose:
+                    return
+                t = ev.get("title") or ""
+                yr = ev.get("year") or ""
+                kd = ev.get("kind") or ""
+                console.print(f"[green]条目{ev.get('count')}[/green] [{src}] {t} ({yr}) {kd} -> {ev.get('detail_url')}")
+            elif et == "warn":
+                console.print(f"[yellow]警告[/yellow] [{src}] {ev.get('message','')} -> {ev.get('detail_url') or ev.get('url')}")
+            elif et == "error":
+                console.print(f"[red]错误[/red] [{src}] {ev.get('message','')} -> {ev.get('url')}")
+            elif et == "category_done":
+                console.print(f"[bold green]分类完成[/bold green]: {src} 抓取 {ev.get('count')} 条")
+            elif et == "site_done":
+                console.print(f"[bold green]遍历完成[/bold green]: 累计条目 {ev.get('total')}")
+        except Exception:
+            pass
+    if auto:
+        total = s.crawl_site(start_url or config.BASE_URL, max_pages_total, max_items_total, progress_cb=_progress)
+    else:
+        total = s.crawl_all(max_pages_per_category, max_items_per_category, progress_cb=_progress)
     console.print(f"[green]抓取完成[/green]，累计条目: {total}")
 
 @app.command()
 def search(title: Optional[str] = typer.Option(None, help="按标题关键词"),
            kind: Optional[str] = typer.Option(None, help="类别: movie/tv/variety/anime"),
            country: Optional[str] = typer.Option(None, help="产地/国家关键词"),
+           language: Optional[str] = typer.Option(None, help="语言关键词，如 中文/日语/英语"),
+           director: Optional[str] = typer.Option(None, help="导演名包含"),
+           actors: Optional[str] = typer.Option(None, help="演员名包含"),
+           rating_source: Optional[str] = typer.Option(None, help="评分来源：Douban/IMDB"),
            tag: Optional[List[str]] = typer.Option(None, help="包含的分类标签，可多次指定"),
            rating_min: Optional[float] = typer.Option(None, help="评分下限"),
            year_from: Optional[int] = typer.Option(None, help="年份起"),
@@ -53,6 +102,10 @@ def search(title: Optional[str] = typer.Option(None, help="按标题关键词"),
         rating_min=rating_min,
         year_from=year_from,
         year_to=year_to,
+        language=language,
+        director=director,
+        actors_substr=actors,
+        rating_source=rating_source,
         limit=limit,
     )
 

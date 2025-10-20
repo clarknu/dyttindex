@@ -77,12 +77,94 @@ def create_db(drop: bool = False) -> None:
             UNIQUE(movie_id, url),
             FOREIGN KEY(movie_id) REFERENCES movies(id) ON DELETE CASCADE
         );
+        -- 新增：断点续爬会话与访问记录
+        CREATE TABLE IF NOT EXISTS crawl_sessions (
+            id TEXT PRIMARY KEY,
+            started_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            notes TEXT
+        );
+        CREATE TABLE IF NOT EXISTS crawl_visits (
+            session_id TEXT NOT NULL,
+            url TEXT NOT NULL,
+            kind TEXT NOT NULL, -- 'page' 或 'detail'
+            visited_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(session_id, url, kind),
+            FOREIGN KEY(session_id) REFERENCES crawl_sessions(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS crawl_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            event TEXT,
+            section TEXT,
+            url TEXT,
+            detail_url TEXT,
+            message TEXT,
+            count INTEGER,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(session_id) REFERENCES crawl_sessions(id) ON DELETE CASCADE
+        );
         """
     )
     # 迁移：为已存在的 download_links 增加 episode 列
     _migrate_download_links_episode(cur)
     conn.commit()
     conn.close()
+
+# 会话与访问记录 API
+
+def ensure_session(conn: sqlite3.Connection, session_id: Optional[str]) -> Optional[str]:
+    """确保会话存在，返回会话ID；若未提供则返回 None。"""
+    if not session_id:
+        return None
+    cur = conn.cursor()
+    cur.execute("INSERT OR IGNORE INTO crawl_sessions(id) VALUES(?)", (session_id,))
+    cur.execute("UPDATE crawl_sessions SET updated_at=CURRENT_TIMESTAMP WHERE id=?", (session_id,))
+    conn.commit()
+    return session_id
+
+
+def get_visited(conn: sqlite3.Connection, session_id: Optional[str], kind: str) -> set:
+    if not session_id:
+        return set()
+    cur = conn.cursor()
+    cur.execute("SELECT url FROM crawl_visits WHERE session_id=? AND kind=?", (session_id, kind))
+    return {row[0] for row in cur.fetchall()}
+
+
+def mark_visited(conn: sqlite3.Connection, session_id: Optional[str], url: str, kind: str) -> None:
+    if not session_id:
+        return
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR IGNORE INTO crawl_visits(session_id, url, kind) VALUES(?,?,?)",
+        (session_id, url, kind),
+    )
+    cur.execute("UPDATE crawl_sessions SET updated_at=CURRENT_TIMESTAMP WHERE id=?", (session_id,))
+    conn.commit()
+
+
+def append_event(conn: sqlite3.Connection, session_id: Optional[str], event: dict) -> None:
+    if not session_id:
+        return
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO crawl_events(session_id, event, section, url, detail_url, message, count)
+        VALUES(?,?,?,?,?,?,?)
+        """,
+        (
+            session_id,
+            event.get("event"),
+            event.get("section") or event.get("category"),
+            event.get("url"),
+            event.get("detail_url"),
+            event.get("message"),
+            event.get("count"),
+        ),
+    )
+    cur.execute("UPDATE crawl_sessions SET updated_at=CURRENT_TIMESTAMP WHERE id=?", (session_id,))
+    conn.commit()
 
 
 def _ensure_tags(conn: sqlite3.Connection, tag_names: Iterable[str]) -> List[int]:
@@ -200,7 +282,7 @@ def search_movies(
     rating_source: Optional[str] = None,
     limit: int = 50,
 ) -> List[sqlite3.Row]:
-    sql = "SELECT id, title, kind, year, country, rating_source, rating_value, tags_text, detail_url FROM movies WHERE 1=1"
+    sql = "SELECT id, title, kind, year, country, director, actors, rating_source, rating_value, tags_text, detail_url FROM movies WHERE 1=1"
     params: List[Any] = []
     if title:
         sql += " AND title LIKE ?"
