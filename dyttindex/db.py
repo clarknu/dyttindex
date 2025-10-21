@@ -104,6 +104,16 @@ def create_db(drop: bool = False) -> None:
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(session_id) REFERENCES crawl_sessions(id) ON DELETE CASCADE
         );
+        -- 新增：持久化前沿队列以支持断点续跑
+        CREATE TABLE IF NOT EXISTS crawl_queue (
+            session_id TEXT NOT NULL,
+            url TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'queued', -- queued|processing|done|error
+            enqueued_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            dequeued_at TEXT,
+            PRIMARY KEY(session_id, url),
+            FOREIGN KEY(session_id) REFERENCES crawl_sessions(id) ON DELETE CASCADE
+        );
         """
     )
     # 迁移：为已存在的 download_links 增加 episode 列
@@ -139,6 +149,42 @@ def mark_visited(conn: sqlite3.Connection, session_id: Optional[str], url: str, 
     cur.execute(
         "INSERT OR IGNORE INTO crawl_visits(session_id, url, kind) VALUES(?,?,?)",
         (session_id, url, kind),
+    )
+    cur.execute("UPDATE crawl_sessions SET updated_at=CURRENT_TIMESTAMP WHERE id=?", (session_id,))
+    conn.commit()
+
+# 持久化前沿队列（断点续跑）
+from typing import List
+
+def enqueue_urls(conn: sqlite3.Connection, session_id: Optional[str], urls: List[str]) -> None:
+    if not session_id or not urls:
+        return
+    cur = conn.cursor()
+    for u in urls:
+        cur.execute(
+            "INSERT OR IGNORE INTO crawl_queue(session_id, url, status) VALUES(?, ?, 'queued')",
+            (session_id, u),
+        )
+    cur.execute("UPDATE crawl_sessions SET updated_at=CURRENT_TIMESTAMP WHERE id=?", (session_id,))
+    conn.commit()
+
+def get_frontier_urls(conn: sqlite3.Connection, session_id: Optional[str], limit: int = 1000) -> List[str]:
+    if not session_id:
+        return []
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT url FROM crawl_queue WHERE session_id=? AND status='queued' ORDER BY enqueued_at ASC LIMIT ?",
+        (session_id, limit),
+    )
+    return [row[0] for row in cur.fetchall()]
+
+def mark_queue_done(conn: sqlite3.Connection, session_id: Optional[str], url: str) -> None:
+    if not session_id:
+        return
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE crawl_queue SET status='done', dequeued_at=CURRENT_TIMESTAMP WHERE session_id=? AND url=?",
+        (session_id, url),
     )
     cur.execute("UPDATE crawl_sessions SET updated_at=CURRENT_TIMESTAMP WHERE id=?", (session_id,))
     conn.commit()
@@ -288,8 +334,12 @@ def search_movies(
         sql += " AND title LIKE ?"
         params.append(f"%{title}%")
     if kind:
-        sql += " AND kind = ?"
-        params.append(kind)
+        if kind == "movie":
+            sql += " AND kind LIKE ?"
+            params.append("movie%")
+        else:
+            sql += " AND kind = ?"
+            params.append(kind)
     if country:
         sql += " AND country LIKE ?"
         params.append(f"%{country}%")

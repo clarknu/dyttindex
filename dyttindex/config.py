@@ -10,19 +10,6 @@ BASE_MIRRORS = [
     "http://www.ygdy8.com",
 ]
 
-# 代表性类别页（常见电影天堂站点结构，可能部分不存在；爬虫会自动跳过404）
-CATEGORIES = {
-    "最新电影": "/html/gndy/dyzz/index.html",
-    "高清电影": "/html/gndy/hd/index.html",
-    "电影总表": "/html/gndy/index.html",
-    "国产剧": "/html/tv/gj/index.html",
-    "美剧": "/html/tv/ous/",
-    "韩剧": "/html/tv/rihan/",
-    "日剧": "/html/tv/rjb/",
-    "综艺": "/html/zongyi/",
-    "动漫": "/html/dongman/",
-}
-
 REQUEST_TIMEOUT = 15
 REQUEST_RETRY = 2
 REQUEST_SLEEP = (0.8, 1.8)  # 每次请求之间的随机睡眠区间（秒）
@@ -41,9 +28,6 @@ USER_AGENTS = [
 
 SQLITE_PATH = "c:/Code/dyttindex/data/movies.db"
 
-# 最大分页与条目控制，避免过度抓取
-DEFAULT_MAX_PAGES_PER_CATEGORY = 50
-DEFAULT_MAX_ITEMS_PER_CATEGORY = 2000
 
 # 自动遍历模式的总量默认值
 DEFAULT_MAX_PAGES_TOTAL = 300

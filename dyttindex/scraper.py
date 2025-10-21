@@ -10,7 +10,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from . import config
-from .db import get_conn, upsert_movie, create_db, ensure_session, get_visited, mark_visited, append_event
+from .db import get_conn, upsert_movie, create_db, ensure_session, get_visited, mark_visited, append_event, enqueue_urls, get_frontier_urls, mark_queue_done
 
 FIELD_PATTERNS = {
     "alias": re.compile(r"^◎\s*(译名|又名)\s*(.*)$"),
@@ -23,7 +23,10 @@ FIELD_PATTERNS = {
     "actors": re.compile(r"^◎\s*(主演|演员)\s*(.*)$"),
     "douban": re.compile(r"^◎\s*(豆瓣评分)\s*([0-9]+(?:\\.[0-9]+)?)"),
     "imdb": re.compile(r"^◎\s*(IMDb|IMDB)评分\s*([0-9]+(?:\\.[0-9]+)?)", re.I),
-    "desc": re.compile(r"^◎\s*(简介|剧情介绍|内容简介)\s*(.*)$"),
+    # 扩展简介识别：兼容“剧情(介绍|简介)/故事梗概/简 介/介绍”等，允许冒号
+    "desc": re.compile(r"^◎\s*(?:简介|剧情(?:介绍|简介)|内容简介|故事梗概|简\s*介|介绍)\s*[:：]?\s*(.*)$"),
+    # 备用简介格式：不带“◎”的【内容简介】/剧情简介/简 介 等
+    "desc_alt": re.compile(r"^(?:【?\s*(?:内容简介|剧情简介|故事梗概|剧情|介绍|简\s*介)\s*】?)\s*[:：]?\s*(.*)$"),
     # 新增：上映信息用于回退年份
     "release": re.compile(r"^◎\s*(上映日期|上映时间|首映|首播)\s*(.*)$"),
 }
@@ -45,69 +48,38 @@ class ListPage:
 
 def _session() -> requests.Session:
     s = requests.Session()
-    s.headers.update(config.DEFAULT_HEADERS)
-    s.headers["User-Agent"] = random.choice(config.USER_AGENTS)
-    # 部分镜像 HTTPS 证书配置不规范，禁用证书校验以提升可用性
+    s.headers.update({
+        "User-Agent": getattr(config, "USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0 Safari/537.36"),
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+    })
     s.verify = False
     return s
 
 
 def _sleep():
-    lo, hi = config.REQUEST_SLEEP
-    time.sleep(random.uniform(lo, hi))
+    time.sleep(random.uniform(0.3, 0.9))
 
 
 def fetch(url: str, s: requests.Session, retry: int = config.REQUEST_RETRY) -> Optional[str]:
-    for i in range(retry + 1):
+    for i in range(max(1, retry)):
         try:
-            r = s.get(url, timeout=config.REQUEST_TIMEOUT)
+            r = s.get(url, timeout=getattr(config, "REQUEST_TIMEOUT", 15))
             if r.status_code == 200:
-                # 修正编码，避免 GB2312/GBK 乱码
-                try:
-                    r.encoding = r.apparent_encoding or r.encoding
-                except Exception:
-                    pass
-                if r.text:
-                    return r.text
-            # 如果返回非200，尝试 http/https 回退
-            if url.startswith("https://"):
-                alt = url.replace("https://", "http://", 1)
-                r2 = s.get(alt, timeout=config.REQUEST_TIMEOUT)
-                if r2.status_code == 200:
-                    try:
-                        r2.encoding = r2.apparent_encoding or r2.encoding
-                    except Exception:
-                        pass
-                    if r2.text:
-                        return r2.text
-        except requests.RequestException:
-            # https 失败则尝试 http
-            if url.startswith("https://"):
-                try:
-                    alt = url.replace("https://", "http://", 1)
-                    r3 = s.get(alt, timeout=config.REQUEST_TIMEOUT)
-                    if r3.status_code == 200:
-                        try:
-                            r3.encoding = r3.apparent_encoding or r3.encoding
-                        except Exception:
-                            pass
-                        if r3.text:
-                            return r3.text
-                except requests.RequestException:
-                    pass
+                return r.text
+        except Exception:
+            pass
         _sleep()
     return None
 
 
 def _abs(url: str) -> str:
-    if url.startswith("http://") or url.startswith("https://"):
+    if url.startswith("http"):
         return url
-    base = config.BASE_URL.rstrip('/')
-    url = url if url.startswith('/') else '/' + url
-    return base + url
+    base = config.BASE_URL.rstrip("/")
+    url2 = url.lstrip("/")
+    return f"{base}/{url2}"
 
-
-# 屏蔽 HTTPS 校验相关警告（根据配置）
 try:
     import warnings
     import urllib3
@@ -123,20 +95,18 @@ except Exception:
 
 
 def resolve_base(s: requests.Session) -> str:
-    chosen = config.BASE_URL
-    for base in getattr(config, "BASE_MIRRORS", [config.BASE_URL]):
+    base = getattr(config, "BASE_URL", "")
+    mirrors = getattr(config, "BASE_MIRRORS", [])
+    # 简单探测镜像可达性
+    for u in [base] + list(mirrors):
         try:
-            resp = s.get(base.rstrip('/'), timeout=config.REQUEST_TIMEOUT)
-            if resp.status_code == 200 and (resp.text or ""):
-                chosen = base.rstrip('/')
-                break
-        except requests.RequestException:
+            r = s.get(u, timeout=getattr(config, "REQUEST_TIMEOUT", 15))
+            if r.status_code == 200:
+                s.headers.update({"Referer": u})
+                return u
+        except Exception:
             pass
-        _sleep()
-    config.BASE_URL = chosen
-    # 设置 Referer 以降低 403/503 风险
-    s.headers["Referer"] = chosen
-    return chosen
+    return base
 
 
 def parse_list_page(html: str, base_url: str) -> ListPage:
@@ -159,7 +129,7 @@ def parse_list_page(html: str, base_url: str) -> ListPage:
     for a in soup.select("a[href]"):
         t = (a.get_text() or "").strip()
         h = a.get("href") or ""
-        if t in {"下一页", "下一頁"}:
+        if t in {"下一页", "下一页"}:
             next_url = _abs(h)
             break
     if not next_url:
@@ -271,11 +241,13 @@ def parse_detail_page(html: str, url: str) -> dict:
     i = 0
     actors_block = []
     desc_collecting = False
-    # 新增：基于页面关键词的标签提取（轻量分词）
+    # 标签关键词增强：补充综艺相关词，减少误判为电影
     _TAG_KEYWORDS = [
         "科幻","喜剧","动作","剧情","爱情","犯罪","战争","悬疑","奇幻","动画","纪录片",
         "青春","古装","武侠","家庭","短片","音乐","综艺","冒险","传记","历史","灾难","体育",
-        "恐怖","惊悚","励志","黑色幽默","同性","西部","儿童","校园","公路","现实","励志"
+        "恐怖","惊悚","励志","黑色幽默","同性","西部","儿童","校园","公路","现实","励志",
+        # 综艺常见类型
+        "真人秀","脱口秀","访谈","选秀","竞技","美食","旅行","婚恋","曲艺","晚会"
     ]
     _QUALITY_KEYWORDS = [
         "4K","UHD","蓝光","原盘","HDR","杜比视界","DV","Remux","BluRay","BDRip","WEB-DL","WEBRip","HDRip",
@@ -285,9 +257,9 @@ def parse_detail_page(html: str, url: str) -> dict:
         "中字","双语","国配","粤语","国语","英语","日语","韩语","法语","德语","俄语","西班牙语","泰语"
     ]
     _SERIES_TAGS = [
-        "全集","完结","合集","系列","全季","第一季","第二季","第三季","第四季"
+        "全集","完结","合集","系列","全季","第一季","第二季","第三季","第四季","特别篇","SP"
     ]
-    
+
     def _extract_additional_tags(data: dict, text: str, url: str) -> list:
         tset = set()
         # 题材关键词：标题、简介、全文
@@ -327,7 +299,7 @@ def parse_detail_page(html: str, url: str) -> dict:
                     tset.add("日剧")
         elif "/dongman/" in lp:
             tset.add("动漫")
-        elif "/zongyi/" in lp:
+        elif ("/zongyi/" in lp) or ("zongyi" in lp):
             tset.add("综艺")
         elif "/gndy/hd/" in lp:
             tset.add("蓝光")
@@ -357,7 +329,7 @@ def parse_detail_page(html: str, url: str) -> dict:
             if m:
                 matched = True
                 if key == "alias":
-                    data["original_title"] = m.group(2).strip()
+                    data["original_title"] = m.group(2).strip() if m.lastindex and m.lastindex >= 2 else m.group(1).strip()
                 elif key == "title":
                     data["title"] = m.group(2).strip()
                 elif key == "year":
@@ -371,7 +343,21 @@ def parse_detail_page(html: str, url: str) -> dict:
                     data["language"] = m.group(2).strip()
                 elif key == "genres":
                     genres = re.split(r"[、,\/\s]", m.group(2).strip())
-                    data["tags"].extend([g for g in genres if g])
+                    genres = [g for g in genres if g]
+                    data["tags"].extend(genres)
+                    # 利用“◎类别/类型”直接辅助判定 kind
+                    if not data.get("kind"):
+                        gl = " ".join(genres).lower()
+                        if any(x in gl for x in ["综艺","真人秀","脱口秀","访谈","选秀","竞技","美食","旅行","婚恋","晚会"]):
+                            data["kind"] = "variety"
+                        elif any(x in gl for x in ["电视剧","剧集","连续剧","drama"]):
+                            data["kind"] = "tv"
+                        elif any(x in gl for x in ["动漫","动画","cartoon","anime"]):
+                            data["kind"] = "anime"
+                        elif any(x in gl for x in ["纪录片","纪录","documentary"]):
+                            data["kind"] = "doc"
+                        elif any(x in gl for x in ["短片","短片集","short"]):
+                            data["kind"] = "short"
                 elif key == "director":
                     data["director"] = m.group(2).strip()
                 elif key == "actors":
@@ -405,9 +391,14 @@ def parse_detail_page(html: str, url: str) -> dict:
                             data["year"] = int(ys[0])
                     except Exception:
                         pass
-                elif key == "desc":
+                elif key in ("desc", "desc_alt"):
                     desc_collecting = True
-                    data["description"] = m.group(2).strip() if m.group(2) else ""
+                    # 兼容不同捕获组：取最后一个捕获组作为正文
+                    try:
+                        grp_idx = m.lastindex or 1
+                        data["description"] = m.group(grp_idx).strip() if m.group(grp_idx) else ""
+                    except Exception:
+                        data["description"] = (m.group(1) or "").strip()
                 break
         if not matched and desc_collecting:
             if l2.startswith("◎"):
@@ -462,16 +453,18 @@ def parse_detail_page(html: str, url: str) -> dict:
     if not data["kind"]:
         lower_path = (url or "").lower()
         ts = data["tags"] or []
-        # 粗粒度：电视剧/动漫/综艺/蓝光，其余默认电影
-        if ("/tv/" in lower_path) or any(t in ts for t in ["电视剧","剧集","连续剧"]):
+        title = (data.get("title") or "")
+        # 优先识别综艺：标题/标签提示“期/真人秀/脱口秀”等
+        if ("/zongyi/" in lower_path) or ("zongyi" in lower_path) or any("综艺" in t for t in ts) or re.search(r"第\s*\d{1,3}\s*期", title):
+            data["kind"] = "variety"
+        # 粗粒度：电视剧/动漫，其余默认电影
+        elif ("/tv/" in lower_path) or any(t in ts for t in ["电视剧","剧集","连续剧"]):
             data["kind"] = "tv"
         elif ("/dongman/" in lower_path) or any(t in ts for t in ["动漫","动画"]):
             data["kind"] = "anime"
-        elif ("/zongyi/" in lower_path) or any("综艺" in t for t in ts):
-            data["kind"] = "variety"
         elif ("/gndy/hd/" in lower_path) or any(t in ts for t in ["蓝光","原盘","4K","UHD"]):
             data["kind"] = "uhd"
-        elif any("纪录片" in t for t in ts):
+        elif any("纪录片" in t or "纪录" in t for t in ts):
             data["kind"] = "doc"
         elif any("短片" in t for t in ts):
             data["kind"] = "short"
@@ -488,273 +481,281 @@ def parse_detail_page(html: str, url: str) -> dict:
                 data["kind"] = "movie_hk"
             elif any(x in cc for x in ["台湾", "taiwan", "tw"]):
                 data["kind"] = "movie_tw"
-            elif any(x in cc for x in ["美国", "英国", "法国", "德国", "西班牙", "意大利", "加拿大", "澳大利亚", "欧洲", "usa", "uk", "fr", "de", "es", "it", "ca", "au", "europe"]):
-                data["kind"] = "movie_en"
             elif any(x in cc for x in ["日本", "japan", "jp"]):
                 data["kind"] = "movie_jp"
             elif any(x in cc for x in ["韩国", "korea", "kr"]):
                 data["kind"] = "movie_kor"
-
-    # 清洗标签
-    data["tags"] = list(dict.fromkeys([t.strip() for t in data["tags"] if t and t.strip()]))
+            elif any(x in cc for x in ["美国", "英国", "法国", "德国", "西班牙", "意大利", "加拿大", "澳大利亚", "欧洲", "usa", "uk", "fr", "de", "es", "it", "ca", "au", "europe"]):
+                data["kind"] = "movie_en"
+    # 和谐覆盖：若路径/标签强提示综艺/电视剧/动漫，则覆盖 movie 细分
+    lower_path2 = (url or "").lower()
+    ts2 = data.get("tags") or []
+    title2 = (data.get("title") or "")
+    if ("zongyi" in lower_path2) or any("综艺" in t for t in ts2) or re.search(r"第\s*\d{1,3}\s*期", title2):
+        data["kind"] = "variety"
+    elif ("/tv/" in lower_path2) or any(t in ts2 for t in ["电视剧","剧集","连续剧"]):
+        data["kind"] = "tv"
+    elif ("/dongman/" in lower_path2) or any(t in ts2 for t in ["动漫","动画"]):
+        data["kind"] = "anime"
     return data
 
+def init_db(drop: bool = False) -> None:
+    create_db(drop=drop)
 
 class DyttScraper:
     def __init__(self, session_id: Optional[str] = None):
         self.s = _session()
-        # 选择镜像并更新 Referer
-        resolve_base(self.s)
+        try:
+            self.base_url = resolve_base(self.s)
+        except Exception:
+            self.base_url = getattr(config, "BASE_URL", "")
+        self.conn = get_conn()
+        self.session_id = ensure_session(self.conn, session_id)
         self._stop = False
-        self.session_id = session_id
+        self._visited_pages = get_visited(self.conn, self.session_id, "page") if self.session_id else set()
+        self._visited_detail = get_visited(self.conn, self.session_id, "detail") if self.session_id else set()
 
     def stop(self) -> None:
         self._stop = True
 
-    def crawl_site(self, start_url: str, max_pages_total: int, max_items_total: int, progress_cb: Optional[Callable[[dict], None]] = None) -> int:
-        """从根路径逐层遍历，动态发现列表页与详情页并抓取。
-        仅在同站点内遍历，限制总页面与总条目数量，避免无限递归。
-        """
-        from collections import deque
-        from urllib.parse import urljoin, urlparse
-
-        # 允许跨镜像主机，但限制在已知镜像集合内
-        mirror_hosts = set()
+    def _emit(self, event: dict, cb: Optional[Callable[[dict], None]] = None) -> None:
         try:
-            for b in getattr(config, "BASE_MIRRORS", [config.BASE_URL]):
-                try:
-                    h = urlparse(b).hostname
-                    if h:
-                        mirror_hosts.add(h.lower())
-                except Exception:
-                    pass
-            base_host = urlparse(config.BASE_URL).hostname
-            if base_host:
-                mirror_hosts.add(base_host.lower())
+            if cb:
+                cb(event)
         except Exception:
             pass
-        # 辅助判断函数（不跨站，仅限镜像主机）
-        def is_allowed(u: str) -> bool:
-            try:
-                pu = urlparse(u)
-                host_u = (pu.hostname or "").lower()
-                return (not host_u) or (host_u in mirror_hosts)
-            except Exception:
-                return True
-
-        def is_detail_url(u: str) -> bool:
-            try:
-                p = urlparse(u)
-                return "/html/" in (p.path or "") and bool(re.search(r"/html/.+/\d+/.+\.html$", p.path or ""))
-            except Exception:
-                return False
-
-        def is_list_like(href: str) -> bool:
-            if re.search(r"(index|list)_\d+\.html$", href):
-                return True
-            if re.search(r"/(gndy|tv|dongman|zongyi)(/|$)", href):
-                return True
-            if href.endswith("/") or href.endswith(".html"):
-                return True
-            return False
-        # 会话与已访问集合
-        db = get_conn()
-        ensure_session(db, self.session_id)
-        total_items = 0
-        visited_pages = get_visited(db, self.session_id, 'page')
-        visited_details = get_visited(db, self.session_id, 'detail')
-        start = start_url or config.BASE_URL
-        q = deque([start])
-        if progress_cb:
-            try:
-                progress_cb({"event": "site_start", "url": start})
-            except Exception:
-                pass
-        append_event(db, self.session_id, {"event": "site_start", "url": start})
-        while q and len(visited_pages) < max_pages_total and total_items < max_items_total and not self._stop:
-            url = q.popleft()
-            if url in visited_pages:
-                continue
-            visited_pages.add(url)
-            mark_visited(db, self.session_id, url, 'page')
-            html = fetch(url, self.s)
-            if not html:
-                if progress_cb:
-                    try:
-                        progress_cb({"event": "error", "section": "site", "url": url, "message": "页面获取失败"})
-                    except Exception:
-                        pass
-                append_event(db, self.session_id, {"event": "error", "section": "site", "url": url, "message": "页面获取失败"})
-                continue
-            lp = parse_list_page(html, config.BASE_URL)
-            # 解析候选链接
-            soup = BeautifulSoup(html, "lxml")
-            new_pages = []
-            for a in soup.select("a[href]"):
-                h = a.get("href") or ""
-                if not h or "javascript:" in h:
-                    continue
-                absu = urljoin(url, h) if not h.startswith("http") else h
-                if not is_allowed(absu):
-                    continue
-                if is_detail_url(absu):
-                    absd = absu
-                    if absd in visited_details:
-                        continue
-                    if total_items >= max_items_total:
-                        break
-                    detail_html = fetch(absd, self.s)
-                    if not detail_html:
-                        if progress_cb:
-                            try:
-                                progress_cb({"event": "warn", "category": "detail", "detail_url": absd, "message": "详情页获取失败"})
-                            except Exception:
-                                pass
-                        append_event(db, self.session_id, {"event": "warn", "category": "detail", "detail_url": absd, "message": "详情页获取失败"})
-                        continue
-                    data = parse_detail_page(detail_html, absd)
-                    upsert_movie(db, data)
-                    total_items += 1
-                    visited_details.add(absd)
-                    mark_visited(db, self.session_id, absd, 'detail')
-                    if progress_cb:
-                        try:
-                            # 动态用内容分类作为 category 展示
-                            progress_cb({"event": "item", "category": data.get("kind"), "count": total_items, "detail_url": absd, "title": data.get("title"), "year": data.get("year"), "kind": data.get("kind")})
-                        except Exception:
-                            pass
-                    append_event(db, self.session_id, {"event": "item", "category": data.get("kind"), "count": total_items, "detail_url": absd, "title": data.get("title"), "year": data.get("year"), "kind": data.get("kind")})
-                    _sleep()
-                else:
-                    if is_list_like(h):
-                        new_pages.append(absu)
-            # 如果首页未解析到入口，尝试常见分类入口的启发式种子
-            if not new_pages and url == start:
-                seeds = [
-                    "/html/gndy/dyzz/index.html",
-                    "/html/gndy/hd/index.html",
-                    "/html/gndy/index.html",
-                    "/html/tv/gj/index.html",
-                    "/html/tv/ous/",
-                    "/html/tv/rihan/",
-                    "/html/tv/rjb/",
-                    "/html/zongyi/",
-                    "/html/dongman/",
-                ]
-                try:
-                    base = config.BASE_URL.rstrip('/') + "/"
-                    for p in seeds:
-                        new_pages.append(urljoin(base, p))
-                except Exception:
-                    pass
-            # 也把下一页加入队列
-            if lp.next_url:
-                new_pages.append(lp.next_url)
-            # 去重与过滤已访问
-            uniq_pages = [p for p in dict.fromkeys(new_pages) if p not in visited_pages]
-            for p in uniq_pages:
-                if len(visited_pages) + len(q) >= max_pages_total:
-                    break
-                q.append(p)
-            if progress_cb:
-                try:
-                    # section 简化为路径段用于展示
-                    sec = "site"
-                    try:
-                        from urllib.parse import urlparse
-                        sec = "/".join([seg for seg in (urlparse(url).path or "/").split("/") if seg]) or "site"
-                    except Exception:
-                        pass
-                    progress_cb({"event": "page", "section": sec, "url": url, "found": len(lp.detail_urls), "queued": len(uniq_pages)})
-                except Exception:
-                    pass
-            append_event(db, self.session_id, {"event": "page", "section": sec if 'sec' in locals() else 'site', "url": url, "found": len(lp.detail_urls), "queued": len(uniq_pages)})
-            _sleep()
-        db.close()
-        if progress_cb:
-            try:
-                progress_cb({"event": "site_done", "total": total_items})
-            except Exception:
-                pass
-        # 会话事件
-        conn2 = get_conn()
-        append_event(conn2, self.session_id, {"event": "site_done", "total": total_items})
-        conn2.close()
-        return total_items
-
-    def crawl_category(self, name: str, path: str, max_pages: int, max_items: int, progress_cb: Optional[Callable[[dict], None]] = None) -> int:
-        db = get_conn()
-        ensure_session(db, self.session_id)
-        count, pages = 0, 0
-        url = _abs(path)
-        while url and pages < max_pages and count < max_items and not self._stop:
-            html = fetch(url, self.s)
-            if not html:
-                if progress_cb:
-                    try:
-                        progress_cb({"event": "error", "category": name, "page": pages + 1, "url": url, "message": "列表页获取失败"})
-                    except Exception:
-                        pass
-                append_event(db, self.session_id, {"event": "error", "category": name, "page": pages + 1, "url": url, "message": "列表页获取失败"})
-                break
-            lp = parse_list_page(html, config.BASE_URL)
-            mark_visited(db, self.session_id, url, 'page')
-            if progress_cb:
-                try:
-                    progress_cb({"event": "page", "category": name, "page": pages + 1, "url": url, "found": len(lp.detail_urls)})
-                except Exception:
-                    pass
-            append_event(db, self.session_id, {"event": "page", "category": name, "page": pages + 1, "url": url, "found": len(lp.detail_urls)})
-            for du in lp.detail_urls:
-                if count >= max_items or self._stop:
-                    break
-                detail_html = fetch(du, self.s)
-                if not detail_html:
-                    if progress_cb:
-                        try:
-                            progress_cb({"event": "warn", "category": name, "detail_url": du, "message": "详情页获取失败"})
-                        except Exception:
-                            pass
-                    append_event(db, self.session_id, {"event": "warn", "category": name, "detail_url": du, "message": "详情页获取失败"})
-                    continue
-                data = parse_detail_page(detail_html, du)
-                upsert_movie(db, data)
-                count += 1
-                mark_visited(db, self.session_id, du, 'detail')
-                if progress_cb:
-                    try:
-                        progress_cb({"event": "item", "category": name, "count": count, "detail_url": du, "title": data.get("title"), "year": data.get("year"), "kind": data.get("kind")})
-                    except Exception:
-                        pass
-                append_event(db, self.session_id, {"event": "item", "category": name, "count": count, "detail_url": du, "title": data.get("title"), "year": data.get("year"), "kind": data.get("kind")})
-                _sleep()
-            url = lp.next_url
-            pages += 1
-            _sleep()
-        db.close()
-        return count
+        try:
+            append_event(self.conn, self.session_id, event)
+        except Exception:
+            pass
 
     def crawl_all(self, max_pages_per_category: int, max_items_per_category: int, progress_cb: Optional[Callable[[dict], None]] = None) -> int:
+        # 兼容旧接口：改为从根路径进行遍历，不再使用分类URL
+        return self.crawl_site(None, max_pages_per_category, max_items_per_category, progress_cb=progress_cb)
+
+    def crawl_site(self, start_url: Optional[str], max_pages_total: int, max_items_total: int, progress_cb: Optional[Callable[[dict], None]] = None) -> int:
+        from urllib.parse import urljoin, urlparse
+        from collections import deque
+        from bs4 import BeautifulSoup
+        # 起点与域名白名单
+        start = (start_url or self.base_url or getattr(config, "BASE_URL", "")).strip()
+        if not start:
+            raise ValueError("缺少起始 URL")
+        base_host = urlparse(start).netloc
+        mirror_hosts = {urlparse(m).netloc for m in getattr(config, "BASE_MIRRORS", []) if m}
+        allowed_hosts = {h for h in ({base_host} | mirror_hosts) if h}
+        # 计数与限制
+        limit_pages = max_pages_total if max_pages_total and max_pages_total > 0 else float("inf")
+        limit_items = max_items_total if max_items_total and max_items_total > 0 else float("inf")
         total = 0
-        for name, path in config.CATEGORIES.items():
+        pages = 0
+        # 队列与去重
+        q = deque()
+        q.append(start)
+        # 断点续跑：加载历史前沿队列，补充到当前队列
+        try:
+            frontier = get_frontier_urls(self.conn, self.session_id, limit=int(limit_pages) if limit_pages != float("inf") else 1000)
+            for u in frontier:
+                if u not in q:
+                    q.append(u)
+        except Exception:
+            pass
+        seen: set[str] = set(self._visited_pages) if self._visited_pages else set()
+        seen_detail: set[str] = set(self._visited_detail) if self._visited_detail else set()
+        def _emit(evt: dict):
+            self._emit(evt, progress_cb)
+        _emit({"event": "site_start", "url": start})
+        while q and pages < limit_pages and total < limit_items and not self._stop:
+            cur = q.popleft()
+            # 去除 fragment
+            cur = cur.split('#')[0]
+            if cur in seen:
+                # 允许起始页再次解析以重建队列（断点续跑）
+                if cur != start:
+                    try:
+                        mark_queue_done(self.conn, self.session_id, cur)
+                    except Exception:
+                        pass
+                    continue
             try:
-                if progress_cb:
-                    try:
-                        progress_cb({"event": "category_start", "category": name})
-                    except Exception:
-                        pass
-                n = self.crawl_category(name, path, max_pages_per_category, max_items_per_category, progress_cb=progress_cb)
-                total += n
-                if progress_cb:
-                    try:
-                        progress_cb({"event": "category_done", "category": name, "count": n})
-                    except Exception:
-                        pass
-            except Exception:
-                # 跳过异常，以保证整体流程
-                pass
-        return total
+                resp = self.s.get(cur, timeout=getattr(config, "REQUEST_TIMEOUT", 15))
+                if resp.status_code != 200:
+                    _emit({"event": "warn", "url": cur, "message": f"HTTP {resp.status_code}"})
+                    seen.add(cur)
+                    mark_visited(self.conn, self.session_id, cur, "page")
+                    continue
+                html = decode_response(resp)
+                # 优先尝试解析为详情页（不依赖 URL 结构）
+                parsed_detail = False
+                try:
+                    data = parse_detail_page(html, cur)
+                    # 仅当解析到有效标题时视为详情页，避免误入库
+                    if data and data.get("title"):
+                        upsert_movie(self.conn, data)
+                        total += 1
+                        parsed_detail = True
+                        _emit({"event": "detail_saved", "detail_url": cur})
+                        mark_visited(self.conn, self.session_id, cur, "detail")
+                        if self.session_id:
+                            seen_detail.add(cur)
+                    else:
+                        _emit({"event": "not_detail", "url": cur})
+                except Exception:
+                    parsed_detail = False
+                # 解析普通页面的链接，继续遍历
+                found = 0
+                queued = 0
+                try:
+                    soup = BeautifulSoup(html, "lxml")
+                    for a in soup.select("a[href]"):
+                        href = a.get("href") or ""
+                        if not href:
+                            continue
+                        if href.startswith("javascript:") or href.startswith("mailto:") or href.startswith("magnet:") or href.startswith("thunder:") or href.startswith("ed2k:"):
+                            continue
+                        nxt = urljoin(cur, href)
+                        if not (nxt.startswith("http://") or nxt.startswith("https://")):
+                            continue
+                        pu = urlparse(nxt)
+                        if allowed_hosts and pu.netloc not in allowed_hosts:
+                            continue
+                        if re.search(r"\.(?:jpg|jpeg|png|gif|webp|css|js|svg|ico|pdf|zip|rar)(?:\?|$)", pu.path, re.IGNORECASE):
+                            continue
+                        nxt = nxt.split('#')[0]
+                        found += 1
+                        if nxt not in seen and nxt not in q:
+                            q.append(nxt)
+                            queued += 1
+                            try:
+                                enqueue_urls(self.conn, self.session_id, [nxt])
+                            except Exception:
+                                pass
+                            try:
+                                enqueue_urls(self.conn, self.session_id, [nxt])
+                            except Exception:
+                                pass
+                    # 额外提取 frame/iframe 的 src
+                    for f in soup.select("frame[src], iframe[src]"):
+                        src = f.get("src") or ""
+                        if not src:
+                            continue
+                        nxt = urljoin(cur, src)
+                        if not (nxt.startswith("http://") or nxt.startswith("https://")):
+                            continue
+                        pu = urlparse(nxt)
+                        if allowed_hosts and pu.netloc not in allowed_hosts:
+                            continue
+                        nxt = nxt.split('#')[0]
+                        found += 1
+                        if nxt not in seen and nxt not in q:
+                            q.append(nxt)
+                            queued += 1
+                    # 处理 meta refresh 重定向
+                    for m in soup.select("meta[http-equiv]"):
+                        try:
+                            hev = (m.get("http-equiv") or "").lower()
+                            if hev == "refresh":
+                                content = m.get("content") or ""
+                                mm = re.search(r"url=([^;]+)", content, re.I)
+                                if mm:
+                                    nxt = urljoin(cur, mm.group(1).strip())
+                                    pu = urlparse(nxt)
+                                    if (nxt.startswith("http://") or nxt.startswith("https://")) and (not allowed_hosts or pu.netloc in allowed_hosts):
+                                        nxt = nxt.split('#')[0]
+                                        found += 1
+                                        if nxt not in seen and nxt not in q:
+                                            q.append(nxt)
+                                            queued += 1
+                                            try:
+                                                enqueue_urls(self.conn, self.session_id, [nxt])
+                                            except Exception:
+                                                pass
+                        except Exception:
+                            pass
+                    _emit({"event": "page", "url": cur, "found": found, "queued": queued})
+                except Exception as e:
+                    _emit({"event": "error", "url": cur, "message": str(e)})
+                # 标记访问
+                pages += 1
+                seen.add(cur)
+                mark_visited(self.conn, self.session_id, cur, "page")
+                try:
+                    mark_queue_done(self.conn, self.session_id, cur)
+                except Exception:
+                    pass
+                try:
+                    mark_queue_done(self.conn, self.session_id, cur)
+                except Exception:
+                    pass
+                if self.session_id:
+                    self._visited_pages.add(cur)
+            except Exception as e:
+                _emit({"event": "error", "url": cur, "message": str(e)})
+                pages += 1
+                seen.add(cur)
+                mark_visited(self.conn, self.session_id, cur, "page")
+        _emit({"event": "site_done", "total": total})
+        return int(total)
+
+    def crawl_all(self, max_pages_per_category: int, max_items_per_category: int, progress_cb: Optional[Callable[[dict], None]] = None) -> int:
+        # 兼容旧接口：改为从根路径进行遍历，不再使用分类URL
+        return self.crawl_site(None, max_pages_per_category, max_items_per_category, progress_cb=progress_cb)
+
+# 健壮解码与乱码检测
+_GARBLED_RE = re.compile(r"(?:\uFFFD|Ã|Â|â[€™”’“]|œ|™)")
+
+def looks_garbled(text: str) -> bool:
+    if not text:
+        return False
+    return len(_GARBLED_RE.findall(text)) >= 2
 
 
-def init_db(drop: bool = False):
-    create_db(drop=drop)
+def decode_response(resp: requests.Response) -> str:
+    b = resp.content or b""
+    # 从头部提取编码
+    encs = []
+    ct = resp.headers.get("Content-Type", "")
+    m_ct = re.search(r"charset=([\-\w\d]+)", ct, re.I)
+    if m_ct:
+        encs.append(m_ct.group(1).lower())
+    # 从字节内容探测 meta charset
+    m_meta = re.search(rb"charset\s*=\s*['\"]?([\-\w\d]+)", b, re.I)
+    if m_meta:
+        try:
+            encs.insert(0, m_meta.group(1).decode("ascii", "ignore").lower())
+        except Exception:
+            pass
+    if resp.encoding:
+        encs.append(str(resp.encoding).lower())
+
+    def _norm(e: Optional[str]) -> Optional[str]:
+        if not e:
+            return None
+        e = e.lower()
+        if e in ("gb2312", "gbk", "gb-2312"):
+            return "gb18030"
+        return e
+
+    cands = []
+    for e in encs:
+        ne = _norm(e)
+        if ne and ne not in cands:
+            cands.append(ne)
+    for e in ["utf-8", "gb18030", "big5", "shift_jis"]:
+        if e not in cands:
+            cands.append(e)
+
+    for e in cands:
+        try:
+            text = b.decode(e, errors="replace")
+            resp.encoding = e
+            return text.lstrip("\ufeff")
+        except Exception:
+            continue
+    try:
+        return b.decode("utf-8", errors="replace")
+    except Exception:
+        return b.decode("latin-1", errors="replace")
+
+
+

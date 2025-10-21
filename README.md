@@ -22,7 +22,7 @@ python -m dyttindex.cli init-db
 ```
 2. 抓取数据（可限制分页与条目）：
 ```bash
-python -m dyttindex.cli crawl --max-pages-per-category 30 --max-items-per-category 1000
+python -m dyttindex.cli crawl --max-pages-total 30 --max-items-total 1000
 ```
 3. 查询示例：
 ```bash

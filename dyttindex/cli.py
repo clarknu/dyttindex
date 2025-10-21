@@ -13,8 +13,9 @@ from .db import (
     search_movies,
     get_movie,
     get_download_links,
+    upsert_movie,
 )
-from .scraper import DyttScraper, init_db
+from .scraper import DyttScraper, init_db, parse_detail_page, decode_response, looks_garbled
 from . import config
 
 app = typer.Typer(add_completion=False, help="DYTT 电影数据库构建与查询 CLI")
@@ -27,55 +28,31 @@ def init_db_cmd(drop: bool = typer.Option(False, help="是否清空并重建数�
 
 @app.command()
 def crawl(
-    auto: bool = typer.Option(True, "--auto/--fixed", help="自动从根路径遍历抓取"),
     start_url: Optional[str] = typer.Option(None, help="起始URL，默认使用 BASE_URL"),
-    max_pages_total: int = typer.Option(config.DEFAULT_MAX_PAGES_TOTAL, help="总页面遍历上限（auto模式）"),
-    max_items_total: int = typer.Option(config.DEFAULT_MAX_ITEMS_TOTAL, help="总条目上限（auto模式）"),
-    max_pages_per_category: int = typer.Option(config.DEFAULT_MAX_PAGES_PER_CATEGORY, help="固定分类模式每类最多分页数"),
-    max_items_per_category: int = typer.Option(config.DEFAULT_MAX_ITEMS_PER_CATEGORY, help="固定分类模式每类最多抓取条目数"),
+    max_pages_total: int = typer.Option(config.DEFAULT_MAX_PAGES_TOTAL, help="总页面遍历上限"),
+    max_items_total: int = typer.Option(config.DEFAULT_MAX_ITEMS_TOTAL, help="总条目上限"),
     verbose: bool = typer.Option(True, "--verbose/--no-verbose", help="打印抓取进度"),
     jsonl: bool = typer.Option(False, "--json/--no-json", help="以 JSON 行输出进度事件"),
     session_id: Optional[str] = typer.Option(None, "--session-id", help="会话ID，用于断点续爬与事件日志"),
 ):
     init_db(drop=False)
     s = DyttScraper(session_id=session_id)
-    def _progress(ev: dict):
-        try:
-            if jsonl:
-                import json
-                print(json.dumps(ev, ensure_ascii=False))
-                return
-            et = ev.get("event")
-            src = ev.get("category") or ev.get("section") or "site"
-            if et == "site_start":
-                console.print(f"[bold blue]开始遍历[/bold blue]: {ev.get('url')}")
-            elif et == "category_start":
-                console.print(f"[bold blue]开始分类[/bold blue]: {src}")
-            elif et == "page":
-                if not verbose:
-                    return
-                console.print(f"[cyan]页面[/cyan] [{src}] -> {ev.get('url')} 详情{ev.get('found')}条 队列+{ev.get('queued')}")
-            elif et == "item":
-                if not verbose:
-                    return
-                t = ev.get("title") or ""
-                yr = ev.get("year") or ""
-                kd = ev.get("kind") or ""
-                console.print(f"[green]条目{ev.get('count')}[/green] [{src}] {t} ({yr}) {kd} -> {ev.get('detail_url')}")
-            elif et == "warn":
-                console.print(f"[yellow]警告[/yellow] [{src}] {ev.get('message','')} -> {ev.get('detail_url') or ev.get('url')}")
-            elif et == "error":
-                console.print(f"[red]错误[/red] [{src}] {ev.get('message','')} -> {ev.get('url')}")
-            elif et == "category_done":
-                console.print(f"[bold green]分类完成[/bold green]: {src} 抓取 {ev.get('count')} 条")
-            elif et == "site_done":
-                console.print(f"[bold green]遍历完成[/bold green]: 累计条目 {ev.get('total')}")
-        except Exception:
-            pass
-    if auto:
-        total = s.crawl_site(start_url or config.BASE_URL, max_pages_total, max_items_total, progress_cb=_progress)
-    else:
-        total = s.crawl_all(max_pages_per_category, max_items_per_category, progress_cb=_progress)
+    def _progress(evt: dict):
+        if jsonl:
+            import json
+            console.print(json.dumps(evt, ensure_ascii=False))
+        elif verbose:
+            if evt.get("event") == "item":
+                console.print(f"条目: {evt.get('title')} ({evt.get('year')}) {evt.get('kind')} -> {evt.get('detail_url')}")
+            elif evt.get("event") == "page":
+                console.print(f"页面: {evt.get('url')} | 链接={evt.get('found')} | 入队={evt.get('queued')}")
+            elif evt.get("event") == "detail_saved":
+                console.print(f"保存详情: {evt.get('detail_url')}")
+            elif evt.get("event") == "warn":
+                console.print(f"[yellow]警告[/yellow]: {evt.get('url')} -> {evt.get('message')}")
+            elif evt.get("event") == "error":
+                console.print(f"[red]错误[/red]: {evt.get('url') or evt.get('detail_url')} -> {evt.get('message')}")
+    total = s.crawl_site(start_url or config.BASE_URL, max_pages_total, max_items_total, progress_cb=_progress)
     console.print(f"[green]抓取完成[/green]，累计条目: {total}")
 
 @app.command()
@@ -108,118 +85,92 @@ def search(title: Optional[str] = typer.Option(None, help="按标题关键词"),
         rating_source=rating_source,
         limit=limit,
     )
-
-    if not results:
-        console.print("[yellow]未找到匹配结果[/yellow]")
-        return
-
-    table = Table(title=f"查询结果 ({len(results)}条)")
-    table.add_column("ID", justify="right", width=6)
-    table.add_column("标题", width=40)
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("ID", justify="right", style="cyan", no_wrap=True)
+    table.add_column("标题")
     table.add_column("类别")
-    table.add_column("年份")
-    table.add_column("产地")
+    table.add_column("年份", justify="right")
+    table.add_column("地区")
     table.add_column("评分")
-    table.add_column("标签", width=36)
-    table.add_column("详情页")
-
-    for r in results:
-        table.add_row(
-            str(r["id"]), r["title"] or "", r["kind"] or "", str(r["year"] or ""), r["country"] or "",
-            f"{r['rating_source'] or ''} {r['rating_value'] or ''}",
-            r["tags_text"] or "", r["detail_url"] or "",
-        )
+    table.add_column("标签")
+    for row in results:
+        tags_text = row[9] or ""
+        table.add_row(str(row[0]), row[1] or "", row[2] or "", str(row[3] or ""), row[4] or "", f"{row[7] or ''}:{row[8] or ''}", tags_text)
     console.print(table)
 
-    if show_downloads:
-        for r in results:
-            console.rule(f"{r['title']} 的下载链接")
-            dls = get_download_links(conn, r["id"])
-            if not dls:
-                console.print("[red]暂无下载链接[/red]")
-                continue
-            dl = Table(show_lines=True)
-            dl.add_column("类型", width=10)
-            dl.add_column("链接")
-            dl.add_column("说明")
-            for d in dls:
-                dl.add_row(d["kind"] or "", d["url"], d["label"] or "")
-            console.print(dl)
-    conn.close()
-
-@app.command()
-def show(movie_id: int):
-    conn = get_conn()
-    m = get_movie(conn, movie_id)
-    if not m:
-        console.print("[red]未找到该电影[/red]")
-        raise typer.Exit(code=1)
-    console.print(f"[bold]{m['title']}[/bold] ({m['year'] or ''}) | {m['kind'] or ''}")
-    console.print(f"产地: {m['country'] or ''}  语言: {m['language'] or ''}")
-    console.print(f"导演: {m['director'] or ''}")
-    if m['actors']:
-        console.print("主演:")
-        console.print(m['actors'])
-    console.print(f"评分: {m['rating_source'] or ''} {m['rating_value'] or ''}")
-    console.print(f"标签: {m['tags_text'] or ''}")
-    console.print(f"详情页: {m['detail_url']}")
-    if m['description']:
-        console.rule("简介")
-        console.print(m['description'])
-    console.rule("下载链接")
-    dls = get_download_links(conn, movie_id)
-    if not dls:
-        console.print("[red]暂无下载链接[/red]")
-    else:
-        for d in dls:
-            console.print(f"- {d['kind'] or ''}: {d['url']}  ({d['label'] or ''})")
-    conn.close()
+    if show_downloads and results:
+        conn = get_conn()
+        first_id = results[0][0]
+        dl = get_download_links(conn, first_id)
+        if dl:
+            console.print("\n[bold green]下载链接（第一条）[/bold green]")
+            for kind, url, label, episode in dl:
+                ep = f"  EP{episode}" if episode else ""
+                console.print(f"- [{kind}] {label}{ep}: {url}")
 
 @app.command("probe")
 def probe(
-    category: str = typer.Option(None, "--category", help="指定分类键，例如 'movies'"),
-    pages: int = typer.Option(1, "--pages", min=1, help="探测列表页数量"),
+    start_url: Optional[str] = typer.Option(None, "--start-url", help="起始URL，默认使用 BASE_URL"),
+    pages: int = typer.Option(1, "--pages", min=1, help="探测遍历的页面数量"),
 ):
-    """探测分类列表页与解析效果，输出每页提取到的详情链接数量与下一页链接。"""
-    if category and category not in config.CATEGORIES:
-        console.print(f"[red]未知分类 {category}，可选：{list(config.CATEGORIES.keys())}[/red]")
-        raise typer.Exit(1)
-    cats = {category: config.CATEGORIES[category]} if category else config.CATEGORIES
+    """从根路径探测页面与链接提取效果，输出每页链接数量。"""
+    s = DyttScraper()
+    collected = 0
+    def _progress(evt: dict):
+        nonlocal collected
+        if evt.get("event") == "page":
+            console.print(f"页面: {evt.get('url')} | 链接={evt.get('found')} | 入队={evt.get('queued')}")
+            collected += 1
+    s.crawl_site(start_url or config.BASE_URL, pages, 0, progress_cb=_progress)
+    console.print(f"探测完成，遍历页面: {collected}")
+
+# 新增：批量修复（重新解析 raw_html 回填 kind/标签/简介 等）
+@app.command("repair")
+def repair(
+    only_kind: Optional[str] = typer.Option(None, "--only-kind", help="仅处理指定 kind 的记录，如 movie"),
+    limit: int = typer.Option(0, "--limit", help="限制处理数量，0 表示不限"),
+):
+    """重新解析数据库中已抓取条目的 raw_html，回填分类、标签与简介。"""
+    conn = get_conn()
+    cur = conn.cursor()
+    sql = "SELECT id, detail_url, raw_html FROM movies WHERE 1=1"
+    params: List[str] = []
+    if only_kind:
+        sql += " AND kind = ?"
+        params.append(only_kind)
+    if limit and limit > 0:
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(str(limit))
+    cur.execute(sql, params)
+    rows = cur.fetchall()
+    if not rows:
+        console.print("[yellow]没有可修复的记录[/yellow]")
+        raise typer.Exit(0)
+    fixed = 0
     scraper = DyttScraper()
-    for name, path in cats.items():
-        url = path if path.startswith("http") else f"{config.BASE_URL.rstrip('/')}/{path.lstrip('/')}"
-        console.print(f"[bold green]分类[/bold green]: {name} -> {url}")
-        cur = url
-        for i in range(pages):
-            html = scraper.s.get(cur, timeout=config.REQUEST_TIMEOUT)
-            if html.status_code != 200:
-                console.print(f"[red]请求失败[/red]: {cur} -> {html.status_code}")
-                break
-            from bs4 import BeautifulSoup
-            soup = BeautifulSoup(html.text, "lxml")
-            # 简单统计
-            links = []
-            for a in soup.select("a[href]"):
-                h = a.get("href") or ""
-                if "/html/" in h and re.search(r"/html/.+/\d+/.+\.html$", h):
-                    links.append(h)
-            next_url = None
-            for a in soup.select("a[href]"):
-                t = (a.get_text() or "").strip()
-                h = a.get("href") or ""
-                if t in {"下一页", "下一頁"}:
-                    next_url = h
-                    break
-            if not next_url:
-                for a in soup.select("a[href]"):
-                    h = a.get("href") or ""
-                    if re.search(r"(list_|index_).*\.html$", h):
-                        next_url = h
-                        break
-            console.print(f"第{i+1}页: 详情链接 {len(links)} 条, 下一页: {next_url}")
-            if not next_url:
-                break
-            cur = next_url if next_url.startswith("http") else f"{config.BASE_URL.rstrip('/')}/{next_url.lstrip('/')}"
+    for r in rows:
+        mid = r[0]
+        url = r[1]
+        html = r[2]
+        # 若库中 HTML 为空或疑似乱码，则重抓并使用健壮解码
+        if not html or looks_garbled(html):
+            try:
+                resp = scraper.s.get(url, timeout=config.REQUEST_TIMEOUT)
+                if resp.status_code == 200:
+                    html = decode_response(resp)
+                else:
+                    console.print(f"[yellow]获取HTML失败[/yellow] id={mid} status={resp.status_code} -> {url}")
+            except Exception as e:
+                console.print(f"[yellow]网络错误[/yellow] id={mid} -> {e}")
+        try:
+            if not html:
+                continue
+            data = parse_detail_page(html, url)
+            upsert_movie(conn, data)
+            fixed += 1
+        except Exception as e:
+            console.print(f"[red]解析失败[/red] id={mid} url={url}: {e}")
+    console.print(f"[bold green]修复完成[/bold green]：更新 {fixed} 条记录")
 
 if __name__ == "__main__":
     app()

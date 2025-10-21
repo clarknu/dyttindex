@@ -46,7 +46,7 @@ def _run_crawl(max_pages: int, max_items: int, sessionid: Optional[str] = None):
         crawl_state["status"] = "running"
         crawl_state["started_at"] = time.time()
         crawl_state["messages"] = []
-        total = _scraper.crawl_all(max_pages, max_items, progress_cb=_progress)
+        total = _scraper.crawl_site(None, max_pages, max_items, progress_cb=_progress)
         crawl_state["total"] = total
         crawl_state["status"] = "done"
     except Exception as e:
@@ -61,8 +61,8 @@ def api_crawl_start():
     global _crawl_thread
     if crawl_state["status"] == "running":
         return jsonify({"ok": False, "message": "已有抓取任务在运行"}), 400
-    max_pages = int(request.json.get("max_pages", config.DEFAULT_MAX_PAGES_PER_CATEGORY))
-    max_items = int(request.json.get("max_items", config.DEFAULT_MAX_ITEMS_PER_CATEGORY))
+    max_pages = int(request.json.get("max_pages", config.DEFAULT_MAX_PAGES_TOTAL))
+    max_items = int(request.json.get("max_items", config.DEFAULT_MAX_ITEMS_TOTAL))
     sessionid = (request.json.get("sessionid") or "").strip() or None
     _crawl_thread = threading.Thread(target=_run_crawl, args=(max_pages, max_items, sessionid), daemon=True)
     _crawl_thread.start()
@@ -222,11 +222,11 @@ def index():
                 <input id="sessionid" placeholder="如 2025-10-taskA" />
               </div>
               <div>
-                <label>每类最多页数</label>
+                <label>页面遍历上限</label>
                 <input id="max_pages" type="number" min="1" value="5" />
               </div>
               <div>
-                <label>每类最多条目</label>
+                <label>条目上限</label>
                 <input id="max_items" type="number" min="1" value="200" />
               </div>
               <div class="actions" style="align-items: end;">
