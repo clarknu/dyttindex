@@ -558,6 +558,33 @@ def parse_detail_page(html: str, url: str) -> dict:
 def init_db(drop: bool = False) -> None:
     create_db(drop=drop)
 
+# 新增：详情页有效性判定，避免列表/搜索/错误页入库
+def is_valid_detail(data: dict) -> bool:
+    try:
+        if not data:
+            return False
+        title = (data.get("title") or "").strip()
+        if len(title) < 2:
+            return False
+        bad_titles = {"搜索结果", "页面不存在", "出错啦", "错误", "资源搜索", "最新电影", "最新电视剧", "电影天堂"}
+        if title in bad_titles:
+            return False
+        core_hits = 0
+        for k in ("director", "actors", "description", "rating_value"):
+            v = data.get(k)
+            if v:
+                core_hits += 1
+        dl = data.get("download_links") or []
+        # 至少命中一个核心字段，或有下载链接
+        if core_hits < 1 and len(dl) == 0:
+            return False
+        # 辅助：若基本三要素均缺失（年份/地区/语言），也视为无效
+        if not (data.get("year") or data.get("country") or data.get("language")) and core_hits == 0 and len(dl) == 0:
+            return False
+        return True
+    except Exception:
+        return False
+
 class DyttScraper:
     def __init__(self, session_id: Optional[str] = None):
         self.s = _session()
@@ -645,8 +672,8 @@ class DyttScraper:
                 parsed_detail = False
                 try:
                     data = parse_detail_page(html, cur)
-                    # 仅当解析到有效标题时视为详情页，避免误入库
-                    if data and data.get("title"):
+                    # 使用严格的详情页判定，避免误入库
+                    if data and is_valid_detail(data):
                         upsert_movie(self.conn, data)
                         total += 1
                         parsed_detail = True
@@ -812,6 +839,7 @@ def decode_response(resp: requests.Response) -> str:
         return b.decode("utf-8", errors="replace")
     except Exception:
         return b.decode("latin-1", errors="replace")
+
 
 
 

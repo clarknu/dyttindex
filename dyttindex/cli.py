@@ -15,7 +15,7 @@ from .db import (
     get_download_links,
     upsert_movie,
 )
-from .scraper import DyttScraper, init_db, parse_detail_page, decode_response, looks_garbled
+from .scraper import DyttScraper, init_db, parse_detail_page, decode_response, looks_garbled, is_valid_detail
 from . import config
 
 app = typer.Typer(add_completion=False, help="DYTT 电影数据库构建与查询 CLI")
@@ -171,11 +171,52 @@ def repair(
             if not html:
                 continue
             data = parse_detail_page(html, url)
+            # 仅当为有效详情页才写回，避免错误页污染库
+            if not is_valid_detail(data):
+                console.print(f"[yellow]跳过无效详情页[/yellow] id={mid} -> {url}")
+                continue
             upsert_movie(conn, data)
             fixed += 1
         except Exception as e:
             console.print(f"[red]解析失败[/red] id={mid} url={url}: {e}")
     console.print(f"[bold green]修复完成[/bold green]：更新 {fixed} 条记录")
+
+# 新增：清理数据库中的无效条目（列表/搜索/错误页）
+@app.command("purge-invalid")
+def purge_invalid(
+    limit: int = typer.Option(0, "--limit", help="限制检查数量，0 表示不限"),
+    dry_run: bool = typer.Option(True, "--dry-run/--no-dry-run", help="预览模式，不执行删除"),
+    verbose: bool = typer.Option(True, "--verbose/--no-verbose", help="显示处理详情"),
+):
+    conn = get_conn()
+    cur = conn.cursor()
+    sql = "SELECT id, detail_url, raw_html FROM movies ORDER BY id DESC"
+    if limit and limit > 0:
+        sql += " LIMIT ?"
+        cur.execute(sql, (limit,))
+    else:
+        cur.execute(sql)
+    bad = 0
+    for mid, url, html in cur.fetchall():
+        if not html:
+            data = None
+        else:
+            try:
+                data = parse_detail_page(html, url)
+            except Exception as e:
+                data = None
+                if verbose:
+                    console.print(f"[red]解析失败[/red] id={mid}: {e}")
+        if not is_valid_detail(data):
+            bad += 1
+            if verbose:
+                console.print(f"[yellow]{'标记删除' if not dry_run else '检测到无效'}[/yellow] id={mid} -> {url}")
+            if not dry_run:
+                cur2 = conn.cursor()
+                cur2.execute("DELETE FROM download_links WHERE movie_id=?", (mid,))
+                cur2.execute("DELETE FROM movies WHERE id=?", (mid,))
+                conn.commit()
+    console.print(f"[bold]{'预览' if dry_run else '删除'}无效条目[/bold]: {bad}")
 
 if __name__ == "__main__":
     app()

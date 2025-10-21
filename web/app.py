@@ -11,7 +11,7 @@ from flask import Flask, request, jsonify, render_template_string
 # 让父目录加入模块搜索路径
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
-from dyttindex.db import get_conn, search_movies, get_movie, get_download_links
+from dyttindex.db import get_conn, search_movies, get_movie, get_download_links, count_movies
 from dyttindex.scraper import DyttScraper, init_db
 from dyttindex import config
 
@@ -107,7 +107,7 @@ def index():
         body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Noto Sans, Arial, "Microsoft YaHei"; margin: 0; background: var(--bg); color: var(--text); }
         header { padding: 16px 24px; background: #fff; border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 999; }
         header h1 { margin: 0; font-size: 18px; }
-        .container { padding: 16px 24px; display: grid; grid-template-columns: 1.2fr 0.8fr; gap: 16px; }
+        .container { padding: 16px 24px; display: grid; grid-template-columns: 1.3fr 0.7fr; gap: 16px; }
         .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 14px; box-shadow: 0 1px 2px rgba(0,0,0,0.03); }
         .card h3 { margin: 0 0 10px 0; font-size: 16px; }
         .grid { display: grid; gap: 10px; }
@@ -121,10 +121,13 @@ def index():
 
         table { width: 100%; border-collapse: collapse; table-layout: fixed; }
         thead th { position: sticky; top: 0; background: #fff; z-index: 2; }
-        th, td { border-bottom: 1px solid var(--border); padding: 8px; text-align: left; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-        tbody tr:hover { background: #f3f6fc; }
-        tbody tr.selected { background: #e8f0fe; }
-        .muted { color: var(--muted); }
+-        th, td { border-bottom: 1px solid var(--border); padding: 8px; text-align: left; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
++        th, td { border-bottom: 1px solid var(--border); padding: 8px; text-align: left; font-size: 13px; white-space: normal; overflow-wrap: anywhere; word-break: break-all; }
+         tbody tr:hover { background: #f3f6fc; }
+         tbody tr.selected { background: #e8f0fe; }
++        /* 强制详情区内容自动换行 */
++        #detail_box, #detail_box * { white-space: normal; overflow-wrap: anywhere; word-break: break-word; }
+         .muted { color: var(--muted); }
         .status { font-size: 12px; color: var(--muted); white-space: pre-line; }
         .pill { display: inline-block; padding: 2px 6px; border-radius: 999px; font-size: 12px; border: 1px solid var(--border); background: #fff; }
         .dl-item { font-size: 13px; margin: 4px 0; }
@@ -205,6 +208,30 @@ def index():
                 <label>标签（逗号分隔）</label>
                 <input id="q_tags" placeholder="科幻, 喜剧, 动作" />
               </div>
+              <div>
+                <label>页码 / 每页条数</label>
+                <div class="actions">
+                  <input id="q_page" type="number" min="1" value="1" />
+                  <input id="q_page_size" type="number" min="10" value="50" />
+                </div>
+              </div>
+              <div>
+                <label>排序字段</label>
+                <select id="q_order_by">
+                  <option value="updated_at">更新时间</option>
+                  <option value="year">年份</option>
+                  <option value="rating">评分</option>
+                  <option value="title">标题</option>
+                  <option value="id">ID</option>
+                </select>
+              </div>
+              <div>
+                <label>排序方向</label>
+                <select id="q_order_dir">
+                  <option value="desc">降序</option>
+                  <option value="asc">升序</option>
+                </select>
+              </div>
             </div>
             <div class="actions" style="margin-top:8px">
               <button id="btn_search" class="primary">检索</button>
@@ -223,6 +250,11 @@ def index():
               </table>
             </div>
             <div class="muted" id="results_hint" style="margin-top:6px">无结果</div>
+            <div class="actions" style="margin-top:6px">
+              <button id="btn_prev">上一页</button>
+              <button id="btn_next">下一页</button>
+              <span class="muted" id="pager_hint"></span>
+            </div>
           </div>
 
           <div class="card">
@@ -318,17 +350,23 @@ def index():
             var t = rawTags[i].replace(/^[\s\u3000]+|[\s\u3000]+$/g, '');
             if(t) p.append('tag', t);
           }
+          var page = parseInt(el('q_page').value||'1', 10); if(!page||page<1) page=1;
+          var pageSize = parseInt(el('q_page_size').value||'50', 10); if(!pageSize||pageSize<1) pageSize=50;
+          add('page', page);
+          add('page_size', pageSize);
+          add('order_by', el('q_order_by').value);
+          add('order_dir', el('q_order_dir').value);
           fetch('/api/search?'+p.toString())
             .then(function(r){ return r.json(); })
-            .then(function(j){ renderResults(j.results || []); })
+            .then(function(j){ renderResults(j.results || [], j.total||0, j.page||page, j.page_size||pageSize); })
             .catch(function(e){ console.error(e); alert('检索失败'); });
         }catch(e){ console.error(e); alert('检索异常'); }
       }
 
-      function renderResults(list){
+      function renderResults(list, total, page, pageSize){
         var tb = el('tbody');
         tb.innerHTML = '';
-        el('results_hint').textContent = (list.length ? ('共 '+list.length+' 条结果') : '无结果');
+        el('results_hint').textContent = (total ? ('共 '+total+' 条结果') : '无结果');
         for(var k=0;k<list.length;k++){
           var row = list[k];
           var tr = document.createElement('tr');
@@ -347,8 +385,14 @@ def index():
           (function(id, trEl){ tr.onclick = function(){ selectRow(trEl); loadDetail(id); }; })(row.id, tr);
           tb.appendChild(tr);
         }
+        var pages = Math.max(1, Math.ceil((total||0) / (pageSize||1)));
+        el('pager_hint').textContent = '第 '+page+' / '+pages+' 页';
+        el('btn_prev').disabled = (page<=1);
+        el('btn_next').disabled = (page>=pages);
       }
 
+      el('btn_prev').onclick = function(){ var p = parseInt(el('q_page').value||'1',10); if(p>1){ el('q_page').value = (p-1); doSearch(); } };
+      el('btn_next').onclick = function(){ var p = parseInt(el('q_page').value||'1',10); el('q_page').value = (p+1); doSearch(); };
       function selectRow(tr){
         if(currentRow) currentRow.classList.remove('selected');
         currentRow = tr; if(tr) tr.classList.add('selected');
@@ -462,6 +506,32 @@ def index():
 @app.get("/api/search")
 def api_search():
     conn = get_conn()
+    # 分页与排序参数
+    page = int(request.args.get("page", "1"))
+    page_size = int(request.args.get("page_size", "50"))
+    if page < 1:
+        page = 1
+    if page_size < 1:
+        page_size = 50
+    offset = (page - 1) * page_size
+    order_by = request.args.get("order_by") or None
+    order_dir = request.args.get("order_dir") or "desc"
+    # 总数
+    total = count_movies(
+        conn,
+        title=request.args.get("title") or None,
+        kind=request.args.get("kind") or None,
+        country=request.args.get("country") or None,
+        tags=request.args.getlist("tag") or None,
+        rating_min=float(request.args.get("rating_min")) if request.args.get("rating_min") else None,
+        year_from=int(request.args.get("year_from")) if request.args.get("year_from") else None,
+        year_to=int(request.args.get("year_to")) if request.args.get("year_to") else None,
+        language=request.args.get("language") or None,
+        director=request.args.get("director") or None,
+        actors_substr=request.args.get("actors") or None,
+        rating_source=request.args.get("rating_source") or None,
+        keyword=request.args.get("keyword") or None,
+    )
     results = search_movies(
         conn,
         title=request.args.get("title") or None,
@@ -475,11 +545,14 @@ def api_search():
         director=request.args.get("director") or None,
         actors_substr=request.args.get("actors") or None,
         rating_source=request.args.get("rating_source") or None,
-        limit=int(request.args.get("limit", "100")),
+        limit=page_size,
         keyword=request.args.get("keyword") or None,
+        offset=offset,
+        order_by=order_by,
+        order_dir=order_dir,
     )
     conn.close()
-    return jsonify({"results": [dict(r) for r in results]})
+    return jsonify({"results": [dict(r) for r in results], "total": total, "page": page, "page_size": page_size})
 
 @app.get("/api/movie/<int:movie_id>")
 def api_movie_get(movie_id: int):

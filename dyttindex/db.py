@@ -336,6 +336,9 @@ def search_movies(
     rating_source: Optional[str] = None,
     limit: int = 50,
     keyword: Optional[str] = None,
+    offset: int = 0,
+    order_by: Optional[str] = None,
+    order_dir: str = "desc",
 ) -> List[sqlite3.Row]:
     sql = "SELECT id, title, kind, year, country, director, actors, rating_source, rating_value, tags_text, detail_url FROM movies WHERE 1=1"
     params: List[Any] = []
@@ -381,8 +384,83 @@ def search_movies(
         for t in tags:
             sql += " AND (tags_text LIKE ?)"
             params.append(f"%{t}%")
-    sql += " ORDER BY updated_at DESC LIMIT ?"
-    params.append(limit)
+    # 排序与分页
+    allowed_order = {
+        "updated_at": "updated_at",
+        "created_at": "created_at",
+        "year": "year",
+        "rating": "rating_value",
+        "title": "title",
+        "id": "id",
+    }
+    ob = allowed_order.get((order_by or "updated_at").lower(), "updated_at")
+    dir_sql = "ASC" if (order_dir or "").lower() == "asc" else "DESC"
+    sql += f" ORDER BY {ob} {dir_sql} LIMIT ? OFFSET ?"
+    params.extend([int(limit), int(offset)])
     cur = conn.cursor()
     cur.execute(sql, params)
     return cur.fetchall()
+
+def count_movies(
+    conn: sqlite3.Connection,
+    title: Optional[str] = None,
+    kind: Optional[str] = None,
+    country: Optional[str] = None,
+    tags: Optional[Iterable[str]] = None,
+    rating_min: Optional[float] = None,
+    year_from: Optional[int] = None,
+    year_to: Optional[int] = None,
+    language: Optional[str] = None,
+    director: Optional[str] = None,
+    actors_substr: Optional[str] = None,
+    rating_source: Optional[str] = None,
+    keyword: Optional[str] = None,
+) -> int:
+    sql = "SELECT COUNT(*) FROM movies WHERE 1=1"
+    params: List[Any] = []
+    if title:
+        sql += " AND title LIKE ?"
+        params.append(f"%{title}%")
+    if keyword:
+        sql += " AND (title LIKE ? OR original_title LIKE ? OR alt_titles_text LIKE ? OR description LIKE ? OR actors LIKE ? OR country LIKE ?)"
+        kw = f"%{keyword}%"
+        params.extend([kw, kw, kw, kw, kw, kw])
+    if kind:
+        if kind == "movie":
+            sql += " AND kind LIKE ?"
+            params.append("movie%")
+        else:
+            sql += " AND kind = ?"
+            params.append(kind)
+    if country:
+        sql += " AND country LIKE ?"
+        params.append(f"%{country}%")
+    if language:
+        sql += " AND language LIKE ?"
+        params.append(f"%{language}%")
+    if director:
+        sql += " AND director LIKE ?"
+        params.append(f"%{director}%")
+    if actors_substr:
+        sql += " AND actors LIKE ?"
+        params.append(f"%{actors_substr}%")
+    if rating_source:
+        sql += " AND rating_source = ?"
+        params.append(rating_source)
+    if rating_min is not None:
+        sql += " AND rating_value >= ?"
+        params.append(rating_min)
+    if year_from is not None:
+        sql += " AND year >= ?"
+        params.append(year_from)
+    if year_to is not None:
+        sql += " AND year <= ?"
+        params.append(year_to)
+    if tags:
+        for t in tags:
+            sql += " AND (tags_text LIKE ?)"
+            params.append(f"%{t}%")
+    cur = conn.cursor()
+    cur.execute(sql, params)
+    row = cur.fetchone()
+    return int(row[0] or 0)
