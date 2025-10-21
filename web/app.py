@@ -119,9 +119,9 @@ def index():
         button.ghost { background: transparent; }
         .actions { display: flex; gap: 8px; }
 
-        table { width: 100%; border-collapse: collapse; }
+        table { width: 100%; border-collapse: collapse; table-layout: fixed; }
         thead th { position: sticky; top: 0; background: #fff; z-index: 2; }
-        th, td { border-bottom: 1px solid var(--border); padding: 8px; text-align: left; font-size: 13px; }
+        th, td { border-bottom: 1px solid var(--border); padding: 8px; text-align: left; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         tbody tr:hover { background: #f3f6fc; }
         tbody tr.selected { background: #e8f0fe; }
         .muted { color: var(--muted); }
@@ -130,6 +130,17 @@ def index():
         .dl-item { font-size: 13px; margin: 4px 0; }
         .dl-item a { color: var(--accent); text-decoration: none; }
         .dl-item a:hover { text-decoration: underline; }
+        /* column sizing */
+        table thead th:nth-child(1), table tbody td:nth-child(1) { width: 64px; }
+        table thead th:nth-child(2), table tbody td:nth-child(2) { width: 220px; }
+        table thead th:nth-child(3), table tbody td:nth-child(3) { width: 90px; }
+        table thead th:nth-child(4), table tbody td:nth-child(4) { width: 80px; }
+        table thead th:nth-child(5), table tbody td:nth-child(5) { width: 120px; }
+        table thead th:nth-child(6), table tbody td:nth-child(6) { width: 160px; }
+        table thead th:nth-child(7), table tbody td:nth-child(7) { width: 240px; }
+        table thead th:nth-child(8), table tbody td:nth-child(8) { width: 120px; }
+        table thead th:nth-child(9), table tbody td:nth-child(9) { width: 200px; }
+        table thead th:nth-child(10), table tbody td:nth-child(10) { width: 70px; }
       </style>
     </head>
     <body>
@@ -143,7 +154,7 @@ def index():
             <div class="grid grid-2">
               <div>
                 <label>关键字</label>
-                <input id="q_title" placeholder="标题关键词" />
+                <input id="q_title" placeholder="标题/简介/演员关键字" />
               </div>
               <div>
                 <label>类别</label>
@@ -203,7 +214,7 @@ def index():
 
           <div class="card">
             <h3>检索结果</h3>
-            <div style="max-height: 380px; overflow: auto; border: 1px solid var(--border); border-radius: 8px;">
+            <div style="max-height: 460px; overflow: auto; border: 1px solid var(--border); border-radius: 8px;">
               <table>
                 <thead>
                   <tr><th>ID</th><th>标题</th><th>类别</th><th>年份</th><th>国别</th><th>导演</th><th>演员</th><th>评分</th><th>标签</th><th>详情</th></tr>
@@ -261,6 +272,7 @@ def index():
                 <div><span class="pill" id="mgr_rating"></span></div>
                 <div style="margin-top:6px">导演：<span id="mgr_director"></span></div>
                 <div style="margin-top:4px">主演：<span id="mgr_actors"></span></div>
+                <div style="margin-top:4px">别名：<span id="mgr_aliases"></span></div>
               </div>
               <div>
                 <label>标签（逗号分隔）</label>
@@ -291,7 +303,7 @@ def index():
         try{
           var p = new URLSearchParams();
           function add(k,v){ if(v) p.append(k,v); }
-          add('title', el('q_title').value);
+          add('keyword', el('q_title').value);
           add('kind', el('q_kind').value);
           add('country', el('q_country').value);
           add('language', el('q_language').value);
@@ -355,6 +367,7 @@ def index():
             setText('mgr_rating', ((m.rating_source||'')+': '+(m.rating_value||'')));
             setText('mgr_director', m.director);
             setText('mgr_actors', m.actors);
+            setText('mgr_aliases', m.alt_titles_text);
             el('mgr_tags').value = m.tags_text || '';
             el('mgr_desc').value = m.description || '';
             var box = el('mgr_dl'); box.innerHTML = '';
@@ -463,6 +476,7 @@ def api_search():
         actors_substr=request.args.get("actors") or None,
         rating_source=request.args.get("rating_source") or None,
         limit=int(request.args.get("limit", "100")),
+        keyword=request.args.get("keyword") or None,
     )
     conn.close()
     return jsonify({"results": [dict(r) for r in results]})

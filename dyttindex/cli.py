@@ -23,6 +23,7 @@ console = Console()
 
 @app.command("init-db")
 def init_db_cmd(drop: bool = typer.Option(False, help="是否清空并重建数据库")):
+    """初始化 SQLite 数据库，创建必要表结构。"""
     create_db(drop=drop)
     console.print("[green]SQLite 初始化完成[/green]: ", config.SQLITE_PATH)
 
@@ -35,6 +36,7 @@ def crawl(
     jsonl: bool = typer.Option(False, "--json/--no-json", help="以 JSON 行输出进度事件"),
     session_id: Optional[str] = typer.Option(None, "--session-id", help="会话ID，用于断点续爬与事件日志"),
 ):
+    """从根路径进行广度优先遍历抓取详情页；支持会话断点续跑（session_id）。"""
     init_db(drop=False)
     s = DyttScraper(session_id=session_id)
     def _progress(evt: dict):
@@ -68,7 +70,9 @@ def search(title: Optional[str] = typer.Option(None, help="按标题关键词"),
            year_from: Optional[int] = typer.Option(None, help="年份起"),
            year_to: Optional[int] = typer.Option(None, help="年份止"),
            limit: int = typer.Option(50, help="返回数量上限"),
-           show_downloads: bool = typer.Option(True, help="是否展示下载链接")):
+           show_downloads: bool = typer.Option(True, help="是否展示下载链接"),
+           keyword: Optional[str] = typer.Option(None, help="跨字段关键字（标题/简介/演员等）")):
+    """按标题、类别、地区、语言、导演、演员、标签、评分与年份过滤检索结果。支持 keyword 跨字段搜索。"""
     conn = get_conn()
     results = search_movies(
         conn,
@@ -84,6 +88,7 @@ def search(title: Optional[str] = typer.Option(None, help="按标题关键词"),
         actors_substr=actors,
         rating_source=rating_source,
         limit=limit,
+        keyword=keyword,
     )
     table = Table(show_header=True, header_style="bold magenta")
     table.add_column("ID", justify="right", style="cyan", no_wrap=True)

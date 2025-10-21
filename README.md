@@ -34,10 +34,25 @@ python -m dyttindex.cli search --kind tv --country 日本 --year-from 2015 --yea
 
 # 按导演/演员/语言/评分来源检索
 python -m dyttindex.cli search --director 张艺谋 --actors 周迅 --language 中文 --rating-source Douban --limit 20
-
-# 查看某条目的详情（含下载链接）
-python -m dyttindex.cli show 123
 ```
+
+## CLI 命令总览
+- `init-db` 初始化数据库
+- `crawl` 从根路径广度优先抓取，支持 `--session-id` 断点续爬
+- `probe` 探测链接提取与队列入库效果（不保存详情）
+- `search` 条件检索并展示下载链接
+- `repair` 重新解析 `raw_html` 批量修复字段
+
+## 查看帮助
+- `python -m dyttindex.cli --help`
+- `python -m dyttindex.cli crawl --help`
+- `python -m dyttindex.cli search --help`
+- `python -m dyttindex.cli probe --help`
+- `python -m dyttindex.cli repair --help`
+
+## 断点续爬
+- 使用 `--session-id` 标识会话，前沿队列与已访问记录会持久化到数据库，重复运行相同 `session-id` 将从断点继续。
+- 起始页也会用于重建队列，即使已访问过；队列持久化表：`crawl_queue`。
 
 ## 设计说明
 - 分类与字段来源：
@@ -57,3 +72,7 @@ python -m dyttindex.cli show 123
 - 已加入镜像列表 `BASE_MIRRORS`（`dyttindex/config.py`），运行时会自动选择可用站点并设置 `Referer` 头。
 - 由于部分镜像的 HTTPS 证书配置不规范，抓取会禁用证书校验（`requests.Session.verify=False`）。如需严格校验，可改为 `True` 并确保所选镜像证书与域名匹配。
 - 如果仍遇到 503/403，可适当增大 `REQUEST_SLEEP`，或手动调整 `BASE_MIRRORS` 的优先顺序。
+
+## Git 忽略与临时文件
+- 仓库已添加 `.gitignore`，忽略 `__pycache__/`、`*.pyc`、虚拟环境目录以及 `data/*.db` 等本地文件。
+- 如需将已跟踪的临时文件移出版本控制，可运行：`git rm --cached <文件或目录>`。

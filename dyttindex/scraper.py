@@ -230,7 +230,34 @@ def parse_detail_page(html: str, url: str) -> dict:
         "raw_html": html,
         "tags": [],
         "download_links": _collect_download_links(zoom),
+        "alt_titles": [],
     }
+
+    # 辅助：拆分名称与判定是否含中文
+    def _contains_cjk(s: str) -> bool:
+        try:
+            return bool(re.search(r"[\u4e00-\u9fff]", s or ""))
+        except Exception:
+            return False
+    def _split_names(s: str) -> list:
+        if not s:
+            return []
+        # 常见分隔符：/ | 、 ， , ; ；
+        toks = [t.strip() for t in re.split(r"[\/\\|、,，;；]+", s) if t and t.strip()]
+        # 去掉重复括号包裹但保留内部文本
+        out = []
+        for t in toks:
+            tt = t.strip()
+            if len(tt) >= 2 and ((tt[0] in "([【『「" and tt[-1] in ")]】』」") ):
+                tt = tt[1:-1].strip()
+            if tt:
+                out.append(tt)
+        return out
+    def _add_alt(n: str):
+        if not n:
+            return
+        if n not in data["alt_titles"]:
+            data["alt_titles"].append(n)
 
     # 海报图
     img = zoom.select_one("img[src]")
@@ -329,9 +356,15 @@ def parse_detail_page(html: str, url: str) -> dict:
             if m:
                 matched = True
                 if key == "alias":
-                    data["original_title"] = m.group(2).strip() if m.lastindex and m.lastindex >= 2 else m.group(1).strip()
+                    raw = m.group(2).strip() if (m.lastindex and m.lastindex >= 2) else (m.group(m.lastindex) or "")
+                    for nm in _split_names(raw):
+                        _add_alt(nm)
                 elif key == "title":
-                    data["title"] = m.group(2).strip()
+                    raw = m.group(2).strip()
+                    if raw:
+                        data["title"] = raw
+                        for nm in _split_names(raw):
+                            _add_alt(nm)
                 elif key == "year":
                     try:
                         data["year"] = int(re.findall(r"(?:19|20)\d{2}", m.group(2))[0])
@@ -497,6 +530,29 @@ def parse_detail_page(html: str, url: str) -> dict:
         data["kind"] = "tv"
     elif ("/dongman/" in lower_path2) or any(t in ts2 for t in ["动漫","动画"]):
         data["kind"] = "anime"
+    # 规范主标题与原名：优先中文作为主标题，英文/非中文作为原名
+    try:
+        cn_names = [t for t in data.get("alt_titles") or [] if _contains_cjk(t)]
+        non_cn = [t for t in data.get("alt_titles") or [] if not _contains_cjk(t)]
+        # 若原片名缺失，尝试从集合中选第一个非中文
+        if not data.get("original_title"):
+            if non_cn:
+                data["original_title"] = non_cn[0]
+            elif data.get("title") and (not _contains_cjk(data["title"])):
+                data["original_title"] = data["title"]
+        # 若主标题为空或为非中文且存在中文译名，选第一个中文名
+        if (not data.get("title")) or ((data.get("title") and not _contains_cjk(data["title"])) and cn_names):
+            if cn_names:
+                data["title"] = cn_names[0]
+        # 将主标题/原名也纳入别名集合
+        for nm in [data.get("title"), data.get("original_title")]:
+            _add_alt(nm or "")
+        # 去重（保持顺序）
+        seen = set()
+        data["alt_titles"] = [x for x in data.get("alt_titles") or [] if (x and not (x in seen or seen.add(x)))]
+    except Exception:
+        pass
+
     return data
 
 def init_db(drop: bool = False) -> None:
@@ -756,6 +812,7 @@ def decode_response(resp: requests.Response) -> str:
         return b.decode("utf-8", errors="replace")
     except Exception:
         return b.decode("latin-1", errors="replace")
+
 
 
 

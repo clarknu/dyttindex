@@ -77,7 +77,7 @@ def create_db(drop: bool = False) -> None:
             UNIQUE(movie_id, url),
             FOREIGN KEY(movie_id) REFERENCES movies(id) ON DELETE CASCADE
         );
-        -- 新增：断点续爬会话与访问记录
+        -- 断点续爬相关表
         CREATE TABLE IF NOT EXISTS crawl_sessions (
             id TEXT PRIMARY KEY,
             started_at TEXT DEFAULT CURRENT_TIMESTAMP,
@@ -87,7 +87,7 @@ def create_db(drop: bool = False) -> None:
         CREATE TABLE IF NOT EXISTS crawl_visits (
             session_id TEXT NOT NULL,
             url TEXT NOT NULL,
-            kind TEXT NOT NULL, -- 'page' 或 'detail'
+            kind TEXT NOT NULL,
             visited_at TEXT DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY(session_id, url, kind),
             FOREIGN KEY(session_id) REFERENCES crawl_sessions(id) ON DELETE CASCADE
@@ -104,11 +104,10 @@ def create_db(drop: bool = False) -> None:
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(session_id) REFERENCES crawl_sessions(id) ON DELETE CASCADE
         );
-        -- 新增：持久化前沿队列以支持断点续跑
         CREATE TABLE IF NOT EXISTS crawl_queue (
             session_id TEXT NOT NULL,
             url TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'queued', -- queued|processing|done|error
+            status TEXT NOT NULL DEFAULT 'queued',
             enqueued_at TEXT DEFAULT CURRENT_TIMESTAMP,
             dequeued_at TEXT,
             PRIMARY KEY(session_id, url),
@@ -118,6 +117,11 @@ def create_db(drop: bool = False) -> None:
     )
     # 迁移：为已存在的 download_links 增加 episode 列
     _migrate_download_links_episode(cur)
+    # 迁移：确保 movies 表存在 alt_titles_text 列
+    cur.execute("PRAGMA table_info(movies)")
+    cols = [row[1] for row in cur.fetchall()]
+    if "alt_titles_text" not in cols:
+        cur.execute("ALTER TABLE movies ADD COLUMN alt_titles_text TEXT")
     conn.commit()
     conn.close()
 
@@ -225,6 +229,8 @@ def _ensure_tags(conn: sqlite3.Connection, tag_names: Iterable[str]) -> List[int
     return ids
 
 
+
+
 def upsert_movie(conn: sqlite3.Connection, data: Dict[str, Any]) -> int:
     assert data.get("detail_url"), "detail_url is required"
     # UPSERT 基本信息
@@ -235,8 +241,8 @@ def upsert_movie(conn: sqlite3.Connection, data: Dict[str, Any]) -> int:
         INSERT INTO movies(
             title, original_title, year, kind, country, language, director, actors,
             rating_source, rating_value, rating_votes, tags_text, description,
-            cover_url, detail_url, raw_html, created_at, updated_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+            cover_url, detail_url, raw_html, alt_titles_text, created_at, updated_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
         ON CONFLICT(detail_url) DO UPDATE SET
             title=excluded.title,
             original_title=excluded.original_title,
@@ -253,6 +259,7 @@ def upsert_movie(conn: sqlite3.Connection, data: Dict[str, Any]) -> int:
             description=excluded.description,
             cover_url=excluded.cover_url,
             raw_html=excluded.raw_html,
+            alt_titles_text=excluded.alt_titles_text,
             updated_at=CURRENT_TIMESTAMP
         """,
         (
@@ -272,6 +279,7 @@ def upsert_movie(conn: sqlite3.Connection, data: Dict[str, Any]) -> int:
             data.get("cover_url"),
             data.get("detail_url"),
             data.get("raw_html"),
+            ",".join(data.get("alt_titles") or []) if data.get("alt_titles") else data.get("alt_titles_text"),
         ),
     )
     # 获取 movie_id
@@ -327,12 +335,17 @@ def search_movies(
     actors_substr: Optional[str] = None,
     rating_source: Optional[str] = None,
     limit: int = 50,
+    keyword: Optional[str] = None,
 ) -> List[sqlite3.Row]:
     sql = "SELECT id, title, kind, year, country, director, actors, rating_source, rating_value, tags_text, detail_url FROM movies WHERE 1=1"
     params: List[Any] = []
     if title:
         sql += " AND title LIKE ?"
         params.append(f"%{title}%")
+    if keyword:
+        sql += " AND (title LIKE ? OR original_title LIKE ? OR alt_titles_text LIKE ? OR description LIKE ? OR actors LIKE ? OR country LIKE ?)"
+        kw = f"%{keyword}%"
+        params.extend([kw, kw, kw, kw, kw, kw])
     if kind:
         if kind == "movie":
             sql += " AND kind LIKE ?"
